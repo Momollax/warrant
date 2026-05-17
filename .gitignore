@@ -1,0 +1,14 @@
+target/
+
+.env
+.env.*
+!.env.example
+
+*.log
+*.tmp
+*.bak
+
+.DS_Store
+Thumbs.db
+
+docker-compose.override.yml

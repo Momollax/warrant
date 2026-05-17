@@ -1,0 +1,731 @@
+# Documentation technique et logique
+
+Ce document reprend l'etat actuel du projet `warrant-fetcher`: ce qui a ete construit, pourquoi, comment les donnees circulent, et quelle logique financiere est appliquee pour analyser les warrants, turbos, mini-futures et produits structures lies a un sous-jacent comme Apple.
+
+> Ce projet produit des signaux d'analyse. Il ne produit pas des recommandations d'achat/vente et ne prouve pas un arbitrage executable. Les frais, le spread bid/ask, le change, la liquidite, la fiscalite, le statut de cotation et les conditions de l'emetteur doivent etre controles avant toute decision.
+
+## Objectif
+
+Le but est de construire une base propre et modulaire pour:
+
+- recuperer le prix actuel du sous-jacent, par exemple `RMS.PA`;
+- recuperer la liste des produits structures Euronext lies au sous-jacent;
+- enrichir chaque produit avec un maximum de caracteristiques utiles;
+- separer proprement calls, puts, maturites, strikes, parites, emetteurs et types de produits;
+- calculer des indicateurs exploitables;
+- afficher les signaux dans une interface claire, notamment avec Ratatui;
+- eviter les faux signaux dus aux produits expires, suspendus, sans prix ou mal compares.
+
+## Sources de donnees
+
+### Yahoo Finance
+
+Utilise pour recuperer le prix du sous-jacent, via le module historique du projet:
+
+- ticker spot: `RMS.PA`;
+- prix;
+- devise;
+- variation en pourcentage.
+
+Ce prix sert de reference pour calculer:
+
+- la moneyness;
+- la valeur intrinseque;
+- la distance au strike ou a la barriere;
+- les comparaisons relatives entre produits.
+
+### Euronext
+
+Euronext est la source principale pour les produits structures.
+
+Deux niveaux sont utilises:
+
+1. Annuaire des produits:
+   - symbole;
+   - ISIN;
+   - MIC;
+   - nom produit;
+   - sous-jacent;
+   - type produit;
+   - strike;
+   - maturite;
+   - dernier prix affiche;
+   - date/heure du dernier prix.
+
+2. `instrumentDetail`:
+   - emetteur;
+   - devise;
+   - date d'emission;
+   - prix d'emission;
+   - strike 1;
+   - strike 2;
+   - devise des strikes;
+   - parite;
+   - nombre de warrants par sous-jacent;
+   - levier;
+   - barriere / seuil bas;
+   - prix d'ouverture;
+   - cloture;
+   - cloture precedente;
+   - haut / bas;
+   - volume;
+   - nombre de trades;
+   - statut de cotation;
+   - statut de trading;
+   - horaires;
+   - DIC/KID quand disponible;
+   - ISIN du sous-jacent quand disponible.
+
+### Boursorama
+
+Boursorama expose parfois des donnees plus pratiques cote affichage:
+
+- bid;
+- ask;
+- taille bid;
+- taille ask;
+- mid price;
+- dernier prix;
+- haut / bas;
+- cloture precedente;
+- volume;
+- date de trade.
+
+L'enrichissement Boursorama existe comme option, car scraper chaque page HTML est beaucoup plus lourd que l'API Euronext.
+
+Activation:
+
+```bash
+BOURSORAMA_ENRICH=1 ./manage.sh analyze hermes RMS.PA 50
+```
+
+ou via Docker:
+
+```bash
+docker run --rm \
+  -e ANALYZE_UNDERLYING=hermes \
+  -e UNDERLYING_TICKER=RMS.PA \
+  -e ANALYZE_LIMIT=50 \
+  -e BOURSORAMA_ENRICH=1 \
+  warrant-fetcher
+```
+
+## Architecture du code
+
+### Modules principaux
+
+- `src/main.rs`
+  - point d'entree;
+  - commandes `discover`, `analyze`, `opportunities`;
+  - export CSV;
+  - selection TUI/table/csv.
+
+- `src/analysis.rs`
+  - construit la base marche complete;
+  - recupere le spot;
+  - decouvre les produits Euronext;
+  - enrichit chaque produit avec `instrumentDetail`;
+  - enrichit optionnellement via Boursorama.
+
+- `src/api/discover.rs`
+  - appelle l'annuaire Euronext;
+  - parse les lignes HTML de l'annuaire;
+  - recupere `instrumentDetail`.
+
+- `src/api/boursorama.rs`
+  - construit l'URL courte Boursorama `1rP{symbol}`;
+  - lit le JSON embarque `data-ist-init`;
+  - extrait bid/ask, tailles et OHLC.
+
+- `src/models/structured.rs`
+  - modele normalise du produit;
+  - direction call/put;
+  - maturite;
+  - prix cote;
+  - details enrichis;
+  - donnees Boursorama optionnelles.
+
+- `src/models/euronext.rs`
+  - structures de deserialisation Euronext;
+  - champs bruts de l'API.
+
+- `src/indicators/warrant.rs`
+  - logique actuelle de classement relatif;
+  - calcul de valeur intrinseque;
+  - prise en compte de la parite;
+  - separation sous-evalue / sur-evalue.
+
+- `src/pricing.rs`
+  - classification des familles de produits;
+  - selection du modele de pricing;
+  - choix de la reference de payoff: strike, barriere ou niveau de financement.
+
+- `src/display/opportunities.rs`
+  - interface Ratatui pour les candidats;
+  - navigation;
+  - filtres call/put;
+  - vue sous-evaluee / sur-evaluee.
+
+- `src/display/headless.rs`
+  - execution sans TUI pour Docker/logs.
+
+## Commandes
+
+Construire l'image:
+
+```bash
+./manage.sh build
+```
+
+Tester un ticker simple:
+
+```bash
+./manage.sh test RMS.PA
+```
+
+Lister les produits Euronext:
+
+```bash
+./manage.sh discover hermes 50
+```
+
+Construire la base enrichie:
+
+```bash
+./manage.sh analyze hermes RMS.PA 50
+```
+
+Chercher des ecarts relatifs:
+
+```bash
+./manage.sh opportunities hermes RMS.PA 500
+```
+
+Filtrer seulement les calls:
+
+```bash
+./manage.sh opportunities hermes RMS.PA 500 call
+```
+
+Filtrer seulement les puts:
+
+```bash
+./manage.sh opportunities hermes RMS.PA 500 put
+```
+
+Exporter les opportunites en CSV:
+
+```bash
+./manage.sh opportunities-csv hermes RMS.PA 500 all
+```
+
+## Modele de donnees logique
+
+Chaque produit est normalise en `StructuredProduct`.
+
+Champs principaux:
+
+- `symbol`: symbole court Euronext, par exemple `IQ33S`;
+- `boursorama_symbol`: symbole Boursorama, par exemple `1rPIQ33S`;
+- `isin`: identifiant produit;
+- `mic`: marche de cotation;
+- `underlying`: sous-jacent;
+- `product_type`: type Euronext;
+- `direction`: `call`, `put` ou `unknown`;
+- `strike`: strike principal;
+- `maturity`: date ou `open-end`;
+- `last_price`: dernier prix connu;
+- `bid_ask`: champ brut annuaire;
+- `detail`: fiche detaillee Euronext;
+- `boursorama_quote`: fiche quote optionnelle Boursorama.
+
+`ProductDetail` porte la fiche enrichie:
+
+- emetteur;
+- devise;
+- strike 1;
+- strike 2;
+- parite brute;
+- `warrants_per_underlying`;
+- levier;
+- seuil/barriere;
+- prix d'ouverture;
+- cloture;
+- cloture precedente;
+- haut/bas;
+- volume;
+- statut de cotation;
+- horaires;
+- DIC/KID.
+
+## Parite et nombre de titres necessaires
+
+La parite est essentielle. Sans elle, on compare des choses qui n'ont pas la meme unite.
+
+Exemple:
+
+- si `parityUnderWar = 50`, il faut environ 50 warrants pour representer une unite du sous-jacent;
+- si `parityFirstWarrantUnderlying = 0.02`, alors `1 / 0.02 = 50`;
+- si un produit cote `1.27 EUR`, cela ne represente pas directement `spot - strike`, mais une fraction de cette exposition.
+
+Le projet normalise cela dans:
+
+```text
+warrants_per_underlying
+```
+
+Puis:
+
+```text
+intrinsic_per_product = raw_intrinsic / warrants_per_underlying
+```
+
+Si le strike ou le niveau de financement est en USD et que le produit cote en EUR, cette valeur est ensuite convertie dans la devise de cotation du produit avant de calculer le ratio. Pour la paire EUR/USD, le projet interroge explicitement l'API Yahoo avec le ticker `EURUSD=X`; pour convertir USD vers EUR, il utilise l'inverse de ce taux.
+
+Sans cette correction, les anciens signaux pouvaient afficher des ecarts absurdes de type `98%`.
+
+## Logique call / put
+
+La logique call et put est directionnelle.
+
+Valeur intrinseque brute:
+
+```text
+Call = max(spot - strike, 0)
+Put  = max(strike - spot, 0)
+```
+
+Donc:
+
+- un call gagne quand le sous-jacent monte;
+- un put gagne quand le sous-jacent baisse;
+- un call est plus dans la monnaie quand son strike est sous le spot;
+- un put est plus dans la monnaie quand son strike est au-dessus du spot.
+
+Les calls et les puts ne doivent pas etre compares ensemble. Le moteur groupe donc les produits par:
+
+- direction;
+- type de produit;
+- devise;
+- maturite;
+- zone de distance au spot.
+
+## Moneyness
+
+Le projet classe un produit en:
+
+- `itm`: in the money;
+- `atm`: at the money;
+- `otm`: out of the money;
+- `unknown`.
+
+Pour le scoring relatif actuel, seuls les produits `itm` sont utilises. Cela evite de comparer un produit avec valeur intrinseque quasi nulle, ou essentiellement compose de valeur temps, avec un produit bien dans la monnaie.
+
+## Types de produits et modeles
+
+Le projet ne suppose pas qu'un warrant classique, un turbo, un mini-future ou un certificat ont exactement la meme formule. Chaque produit est d'abord classe en famille, puis un modele de calcul est choisi.
+
+Base commune:
+
+```text
+direction
+spot
+strike
+parite
+prix
+devise
+maturite
+statut
+```
+
+Mais la logique doit ensuite etre specialisee:
+
+- `warrant / warrant_intrinsic`: payoff call/put classique sur le strike;
+- `mini_future / financing_level`: payoff sur le niveau de financement, avec barriere separee;
+- `turbo / financing_level`: payoff sur le niveau de financement quand il est disponible;
+- `open_end_knock_out / financing_level`: utilise le financement si Euronext le fournit;
+- `open_end_knock_out / barrier_only`: fallback sur la barriere/strike si aucun financement n'est disponible;
+- `certificate / unsupported`: ignore dans le scoring relatif tant qu'un payoff dedie n'est pas implemente;
+- `other / unsupported`: ignore dans le scoring relatif.
+
+L'etape actuelle est donc une base de scoring relatif, pas encore un pricer complet.
+
+## Scoring relatif actuel
+
+Le scoring actuel cherche les produits decorelles par rapport a leurs pairs.
+
+Pour chaque produit comparable:
+
+```text
+pricing_spec = famille + modele + reference de payoff
+prix_utilise = ask executable si disponible, sinon dernier prix non verifie
+raw_intrinsic = valeur intrinseque call/put
+intrinsic_per_product = raw_intrinsic / warrants_per_underlying
+intrinsic_per_product = conversion FX vers la devise du produit
+price_to_intrinsic = prix_utilise / intrinsic_per_product
+```
+
+Pour garder l'interface rapide, `manage.sh opportunities` laisse `BOURSORAMA_ENRICH=0` par defaut. Sans enrichissement, un produit peut donc etre affiche avec `price_source = last_unverified`: il faut alors le considerer comme un signal de recherche, pas comme un prix d'achat executable. Si on lance `BOURSORAMA_ENRICH=1 ./manage.sh opportunities ...`, Boursorama est consulte et un carnet borgne avec `ask = 0` est exclu des candidats achetables. Ce mode est plus fiable mais beaucoup plus lent sur 500 produits.
+
+Le parsing du carnet distingue maintenant trois cas:
+
+- `3,140 / 3,150 EUR`: ask positif, le prix utilise est `3.150 EUR`;
+- `3,620 / 0,000 EUR`: ask explicitement nul, le produit est exclu et on ne retombe pas sur le dernier prix;
+- `/`: carnet inconnu cote Euronext, fallback possible vers `last_unverified`.
+
+Quand un prix cote est en `EUR` et le strike en `USD`, les devises restent separees: le prix utilise porte sa devise de cotation, puis le module FX convertit vers la devise de reference du payoff.
+
+La metrique de comparaison depend ensuite du modele de produit.
+
+Pour les turbos, mini-futures et knock-out a financement, on conserve:
+
+```text
+relative_metric = price_to_intrinsic
+```
+
+Pour les warrants vanille, `price_to_intrinsic` n'est pas une bonne metrique de ranking: un warrant contient une valeur temps, et peut donc valoir beaucoup plus que sa seule valeur intrinseque jusqu'a l'echeance. On utilise donc la prime de break-even, avec le prix du warrant converti dans la devise de reference du sous-jacent:
+
+```text
+warrant_price_ref = prix_warrant converti vers la devise strike/sous-jacent
+
+premium_call_pct =
+  (strike + warrant_price_ref * warrants_per_underlying - spot)
+  / spot
+  * 100
+
+premium_put_pct =
+  (spot + warrant_price_ref * warrants_per_underlying - strike)
+  / spot
+  * 100
+
+relative_metric = premium_pct
+```
+
+Cette prime indique le mouvement necessaire du sous-jacent pour atteindre le point mort a maturite. Elle ne remplace pas un modele theorique complet, mais evite de prendre la valeur temps normale d'un warrant pour une anomalie.
+
+Ensuite, dans chaque groupe de pairs:
+
+```text
+median = median(relative_metric des pairs)
+gap_pct = (median - relative_metric) / median * 100
+```
+
+Interpretation:
+
+- `gap_pct > 0`: le produit est moins cher que la mediane de ses pairs, donc candidat sous-evalue;
+- `gap_pct < 0`: le produit est plus cher que la mediane, donc candidat sur-evalue;
+- `score = abs(gap_pct)`.
+
+Exemple:
+
+```text
+relative_metric = 1.1158
+median = 1.2310
+gap_pct = (1.2310 - 1.1158) / 1.2310 * 100 = +9.36%
+```
+
+Dans la TUI, la zone `Notes` affiche maintenant:
+
+- la formule de la metrique (`premium_pct` ou `price_to_intrinsic`);
+- la formule du `gap`;
+- apres `Entree`, l'URL Boursorama et le recapitulatif du calcul utilise.
+
+Le moteur compare seulement des produits dans un bucket compatible:
+
+```text
+famille | modele | direction | moneyness | devise | maturite | distance a la reference
+```
+
+La largeur de la bande de distance depend du modele:
+
+- warrants vanille: bande de `5%`, car un call tres ITM et un call ATM n'ont pas la meme structure de valeur temps;
+- produits a financement/barriere: bande de `20%`, car la metrique reste proche du rapport prix / intrinseque finance.
+
+Les produits deja arrives a maturite, y compris le jour de maturite, sont exclus du scoring relatif. Exemple: un warrant maturite `2026-05-15` ne doit plus participer a une analyse lancee le `2026-05-17`.
+
+Le moteur affiche:
+
+- top 10 sous-evalues;
+- top 10 sur-evalues.
+
+## Filtres d'exclusion
+
+Les exclusions actuelles evitent les produits manifestement inutilisables.
+
+Exclus:
+
+- produit sans fiche detaillee;
+- produit non liste;
+- produit arrive a maturite ou le jour de sa maturite;
+- `quotation_state = HAL`;
+- `trading_status = HAL` ou `SUS`;
+- prix nul ou absent;
+- direction inconnue;
+- produit non `itm` pour le scoring relatif.
+
+Important: `CLO` n'est plus exclu automatiquement, car le marche peut simplement etre ferme. Si on exclut `CLO`, un run le week-end peut faire disparaitre toute la base.
+
+## Affichage Ratatui
+
+La vue `opportunities` utilise Ratatui si le terminal est interactif.
+
+Touches:
+
+- `a`: tous les produits;
+- `c`: calls;
+- `p`: puts;
+- `u`: sous-evalues;
+- `o`: sur-evalues;
+- `Entree`: ouvrir la page Boursorama du produit selectionne;
+- fleches ou `j/k`: navigation;
+- `q` ou `Esc`: quitter.
+
+Colonnes principales:
+
+- `Gap`: ecart a la mediane du groupe;
+- `Symbol`;
+- `Side`;
+- `Type`;
+- `Mat.`;
+- `Price`;
+- `price_source` dans le CSV et le detail TUI: source du prix utilise pour la metrique;
+- `Ref.`: reference de payoff utilisee pour le calcul;
+- `Parity`;
+- `Intr/W`: valeur intrinseque par warrant, convertie dans la devise du produit;
+- `Metric`: metrique de comparaison (`premium_pct` pour warrant vanille, `price_to_intrinsic` pour produits a financement/barriere);
+- `Median`;
+- `Peers`.
+
+## Pourquoi les premiers resultats etaient faux
+
+Au debut, le calcul comparait:
+
+```text
+prix du warrant / valeur intrinseque brute du sous-jacent
+```
+
+Cela oubliait que:
+
+- 1 warrant ne represente pas forcement 1 action;
+- il faut parfois 10, 50 ou 100 warrants pour une action;
+- les produits peuvent etre suspendus;
+- certains produits affichent `0`;
+- les bid/ask executables ne sont pas forcement disponibles;
+- les produits proches du strike peuvent etre domines par valeur temps.
+
+La correction principale a ete:
+
+```text
+valeur intrinseque par produit =
+  valeur intrinseque brute
+  / parite normalisee
+  * taux FX vers la devise de cotation
+```
+
+Puis classement par pairs plus stricts.
+
+Pour les mini-futures/turbos, une correction supplementaire est appliquee: quand Euronext fournit un deuxieme strike correspondant au niveau de financement, le scoring utilise ce niveau comme reference de payoff. Exemple: `304TB` affiche un seuil de securite autour de `303.93 USD`, mais son niveau de financement est `323.3389 USD`. Utiliser `303.93` donnait une valeur intrinseque beaucoup trop basse et donc un faux signal sur-evalue.
+
+Pour les warrants vanille, une autre correction est appliquee: le ranking ne compare plus `prix / valeur intrinseque`. Exemple: `D12QS` est un Warrant Call Apple strike `280 USD`, maturite `19/03/27`, parite `10`. Avec un spot Apple proche de `300.23 USD`, sa valeur intrinseque convertie en EUR est autour de `1.74 EUR`, mais son prix de marche autour de `3.99 EUR` inclut une valeur temps jusqu'en mars 2027. Le ratio `3.99 / 1.74 = 2.29` n'est donc pas une erreur de marche. La metrique correcte pour ce ranking devient la prime de point mort, environ:
+
+```text
+(280 + prix_warrant_USD * 10 - 300.23) / 300.23 * 100
+```
+
+Cette valeur est de l'ordre de quelques pourcents, pas de centaines de pourcents.
+
+## Exemple IQ33S
+
+Produit Boursorama:
+
+```text
+1rPIQ33S
+ISIN: DE000FE5GCW4
+Sous-jacent: APPLE
+Type: Mini-Future Long / Turbo infini call
+Strike 1: 235.89 USD
+Strike 2: 228.36 USD
+Parite: 50 warrants pour 1 sous-jacent
+Maturite: open-end
+Emetteur: Societe Generale
+```
+
+Dans l'export `analyze`, on retrouve notamment:
+
+- `symbol = IQ33S`;
+- `boursorama_symbol = 1rPIQ33S`;
+- `isin = DE000FE5GCW4`;
+- `strike = 235.8900`;
+- `second_strike = 228.3600`;
+- `warrants_per_underlying = 50.0000`;
+- `leverage = 4.4400`;
+- `lower_threshold = 235.8900`;
+- `open_price`;
+- `close_price`;
+- `previous_close_price`;
+- `high_price`;
+- `low_price`;
+- `volume`;
+- `quotation_state`;
+- `trading_status`;
+- `opening_time`;
+- `closing_time`;
+- `kid_url`.
+
+Avec `BOURSORAMA_ENRICH=1`, on ajoute aussi:
+
+- `boursorama_bid`;
+- `boursorama_ask`;
+- `boursorama_mid`;
+- tailles bid/ask;
+- OHLC Boursorama.
+
+## Limites connues
+
+Le projet n'est pas encore un pricer complet.
+
+Limites actuelles:
+
+- bid/ask executables pas toujours disponibles sans enrichissement Boursorama;
+- pas encore de frais broker;
+- pas encore de verification des conditions emetteur;
+- pas encore de volatilite implicite;
+- pas encore de modele Black-Scholes pour warrants vanille;
+- pas encore de payoff specialise pour toutes les familles exotiques;
+- scraping Boursorama couteux si active sur beaucoup de produits;
+- certains champs Euronext varient selon emetteur et type de produit.
+
+## Prochaines etapes logiques
+
+1. Ajouter un module `pricing` par famille:
+   - `warrant`;
+   - `turbo`;
+   - `mini_future`;
+   - `certificate`.
+
+2. Renforcer le module FX:
+   - historiser le taux utilise;
+   - detecter les taux obsoletes;
+   - ajouter une source de secours si Yahoo ne repond pas.
+
+3. Utiliser prioritairement:
+   - mid price si bid/ask disponible;
+   - dernier prix sinon;
+   - exclure les produits avec spread trop large.
+
+4. Calculer des indicateurs plus solides:
+   - spread percent;
+   - distance a la barriere;
+   - levier effectif;
+   - valeur intrinseque corrigee FX;
+   - premium/discount;
+   - liquidite;
+   - score de qualite de donnees.
+
+5. Ajouter une vue Ratatui detaillee par produit:
+   - fiche complete;
+   - parite;
+   - barriere;
+   - bid/ask;
+   - issuer;
+   - horaires;
+   - DIC;
+   - statut;
+   - alertes de donnees manquantes.
+
+6. Ajouter des tests unitaires:
+   - call vs put;
+   - parite `50` vs `0.02`;
+   - produit suspendu;
+   - produit sans prix;
+   - scoring sous/sur-evalue.
+
+## Principe directeur
+
+La base doit rester modulaire:
+
+```text
+collecte donnees -> normalisation -> enrichissement -> filtres qualite -> pricing -> indicateurs -> affichage
+```
+
+Chaque etape doit pouvoir evoluer sans casser les autres. C'est ce qui permettra ensuite d'ajouter des indicateurs de plus en plus serieux sans melanger scraping, parsing, logique financiere et interface utilisateur.
+
+## Moteur Black-Scholes, IV et Smile
+
+Le pipeline d'opportunites suit maintenant cette logique:
+
+```text
+flux Euronext/Boursorama
+  -> data cleansing strict: bid > 0, ask > 0, tailles positives, spread coherent
+  -> ajustement FX et dividendes
+  -> Black-Scholes sur warrants vanille dates
+  -> volatilite implicite du produit
+  -> smile median des pairs comparables
+  -> signal IV: iv_cheap / iv_neutral / iv_expensive
+```
+
+Les variables configurables sont dans `.env`:
+
+```text
+OPTION_RISK_FREE_RATE=0.045
+OPTION_DIVIDEND_YIELD=0.005
+OPTION_IV_SIGNAL_THRESHOLD=0.03
+OPPORTUNITY_DEBUG=0
+OPPORTUNITY_DEBUG_EVERY=25
+MARKET_DATA_API_KEY=changeme_demo_key
+DIVIDEND_API_KEY=changeme_demo_key
+VOLATILITY_API_KEY=changeme_demo_key
+ORATS_BASE_URL=https://api.orats.io
+POLYGON_BASE_URL=https://api.polygon.io
+```
+
+`OPPORTUNITY_DEBUG=1` active des traces sur stderr pour comprendre ou le pipeline ralentit: recuperation du spot, pages Euronext, enrichissement des details, validation Boursorama, FX, ranking et affichage. `OPPORTUNITY_DEBUG_EVERY` controle la frequence des compteurs dans les boucles longues. Quand le debug est actif et que `OPPORTUNITY_FORMAT` est vide, `manage.sh opportunities` bascule par defaut en sortie `table` pour rendre les traces visibles.
+
+Les trois cles sont fictives pour l'instant. Pour passer en production, il faudra choisir une ou plusieurs APIs:
+
+- taux sans risque: FRED, ECB, Treasury API ou provider broker;
+- dividendes/previsions: Polygon, TwelveData, Alpha Vantage, Financial Modeling Prep, Nasdaq Data Link;
+- volatilite historique/options chain: Polygon, Tradier, ORATS, Cboe DataShop, Interactive Brokers.
+
+Le modele Black-Scholes actuellement implemente sert aux warrants vanille avec maturite datee. Les turbos, mini-futures et knock-out restent sur leur logique a financement/barriere, car Black-Scholes n'est pas le bon modele principal pour ces produits.
+
+`ORATS_API_KEY` accepte plusieurs tokens separes par des virgules:
+
+```text
+ORATS_API_KEY=token_1,token_2,token_3
+```
+
+Le client ORATS dedoublonne les tokens en conservant l'ordre. Lors d'un appel ORATS, il essaie le token courant, puis passe automatiquement au suivant en cas de `401`, `403`, `429`, erreur reseau ou erreur serveur `5xx`. Les erreurs fonctionnelles comme `400` ou `404` ne provoquent pas de rotation, car elles signalent plutot une requete invalide ou une ressource absente.
+
+`POLYGON_API_KEY` suit la meme logique:
+
+```text
+POLYGON_API_KEY=key_1,key_2,key_3
+POLYGON_BASE_URL=https://api.polygon.io
+```
+
+Le client Polygon utilise le parametre `apiKey` dans la query string, dedoublonne les cles et passe automatiquement a la suivante en cas de cle refusee, rate limit, erreur reseau ou erreur serveur. La commande de verification rapide est:
+
+```bash
+./manage.sh polygon-test RMS.PA
+```
+
+Interactive Brokers n'est pas requis par ce pipeline: les chemins ajoutes ici passent uniquement par Polygon, ORATS, Boursorama, Euronext/Yahoo et les donnees FX deja branchees.
+
+Nouveaux champs exportes dans `opportunities-csv` et affiches dans Ratatui:
+
+- `bid_price`, `ask_price`, `mid_price`;
+- `spread_pct`;
+- `execution_status`;
+- `data_quality_score`;
+- `liquidity_score`;
+- `barrier_distance_pct`;
+- `effective_gearing`;
+- `premium_discount_pct`;
+- `years_to_maturity`;
+- `risk_free_rate`;
+- `dividend_yield`;
+- `implied_volatility`;
+- `smile_median_iv`;
+- `smile_gap_vol_points`;
+- `volatility_signal`.

@@ -1,3 +1,10 @@
+pub mod boursorama;
+pub mod boursorama_discover;
 pub mod client;
+pub mod discover;
 pub mod fetch;
 pub mod fetch_all;
+pub mod fx;
+pub mod keyring;
+pub mod orats;
+pub mod polygon;
