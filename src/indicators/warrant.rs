@@ -31,7 +31,7 @@ impl ValuationSide {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct OpportunitySignal {
     pub symbol: String,
     pub web_url: String,

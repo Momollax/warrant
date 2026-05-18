@@ -1,5 +1,7 @@
 pub mod boursorama;
 pub mod boursorama_discover;
+pub mod candle_cache;
+pub mod candles;
 pub mod client;
 pub mod discover;
 pub mod fetch;

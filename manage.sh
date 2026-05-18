@@ -63,6 +63,10 @@ require_running() {
     fi
 }
 
+ensure_data_dir() {
+    mkdir -p data
+}
+
 # ── Commandes ─────────────────────────────────────────────────────────────────
 
 cmd_build() {
@@ -218,6 +222,24 @@ cmd_polygon_test() {
         ./warrant_fetcher polygon-test "${ticker}"
 }
 
+cmd_candles() {
+    local ticker="${1:-${UNDERLYING_TICKER:-RMS.PA}}"
+    local range="${2:-${CANDLES_RANGE:-6mo}}"
+    local interval="${3:-${CANDLES_INTERVAL:-1d}}"
+    local mode="${4:-${CANDLES_MODE:-cache}}"
+    local cache_dir="${MARKET_DATA_CACHE_DIR:-data/cache/candles}"
+    ensure_data_dir
+    info "Bougies '${ticker}' range=${range} interval=${interval} mode=${mode}..."
+    docker run --rm \
+        -v "${PWD}/data:/app/data" \
+        -e "CANDLES_TICKER=${ticker}" \
+        -e "CANDLES_RANGE=${range}" \
+        -e "CANDLES_INTERVAL=${interval}" \
+        -e "CANDLES_MODE=${mode}" \
+        -e "MARKET_DATA_CACHE_DIR=${cache_dir}" \
+        "${IMAGE}"
+}
+
 cmd_discover() {
     local underlying="${1:-${DISCOVER_UNDERLYING:-hermes}}"
     local limit="${2:-${DISCOVER_LIMIT:-}}"
@@ -261,12 +283,20 @@ cmd_opportunities() {
     local opportunity_debug_every="${OPPORTUNITY_DEBUG_EVERY:-25}"
     local requested_format="${OPPORTUNITY_FORMAT:-}"
     local interactive_format="${requested_format:-tui}"
+    local cache_dir="${MARKET_DATA_CACHE_DIR:-data/cache/candles}"
+    local candles_range="${CANDLES_RANGE:-6mo}"
+    local candles_interval="${CANDLES_INTERVAL:-1d}"
+    local market_data_refresh="${MARKET_DATA_REFRESH:-0}"
+    local broker_fee_profile="${BROKER_FEE_PROFILE:-custom}"
+    local fee_order_notional="${FEE_ORDER_NOTIONAL:-1000}"
     if [[ -z "${requested_format}" && "${opportunity_debug}" =~ ^(1|true|yes|on)$ ]]; then
         interactive_format="table"
     fi
+    ensure_data_dir
     info "Recherche de décorrélations relatives pour '${underlying}' avec spot '${underlying_ticker}'…"
     if [[ -t 0 && -t 1 ]]; then
         docker run --rm -it \
+            -v "${PWD}/data:/app/data" \
             -e "TERM=${TERM:-xterm-256color}" \
             -e "OPPORTUNITY_UNDERLYING=${underlying}" \
             -e "UNDERLYING_TICKER=${underlying_ticker}" \
@@ -284,6 +314,37 @@ cmd_opportunities() {
             -e "POLYGON_BASE_URL=${polygon_base_url}" \
             -e "OPPORTUNITY_DEBUG=${opportunity_debug}" \
             -e "OPPORTUNITY_DEBUG_EVERY=${opportunity_debug_every}" \
+            -e "MARKET_DATA_CACHE_DIR=${cache_dir}" \
+            -e "CANDLES_RANGE=${candles_range}" \
+            -e "CANDLES_INTERVAL=${candles_interval}" \
+            -e "MARKET_DATA_REFRESH=${market_data_refresh}" \
+            -e "BROKER_FEE_PROFILE=${broker_fee_profile}" \
+            -e "FEE_ORDER_NOTIONAL=${fee_order_notional}" \
+            ${DECISION_MIN_ENTRY_EDGE_PCT:+-e "DECISION_MIN_ENTRY_EDGE_PCT=${DECISION_MIN_ENTRY_EDGE_PCT}"} \
+            ${DECISION_MIN_CONFIDENCE_SCORE:+-e "DECISION_MIN_CONFIDENCE_SCORE=${DECISION_MIN_CONFIDENCE_SCORE}"} \
+            ${DECISION_MAX_SPREAD_PCT:+-e "DECISION_MAX_SPREAD_PCT=${DECISION_MAX_SPREAD_PCT}"} \
+            ${DECISION_MIN_DATA_QUALITY_SCORE:+-e "DECISION_MIN_DATA_QUALITY_SCORE=${DECISION_MIN_DATA_QUALITY_SCORE}"} \
+            ${DECISION_MIN_LIQUIDITY_SCORE:+-e "DECISION_MIN_LIQUIDITY_SCORE=${DECISION_MIN_LIQUIDITY_SCORE}"} \
+            ${DECISION_MIN_PEER_COUNT:+-e "DECISION_MIN_PEER_COUNT=${DECISION_MIN_PEER_COUNT}"} \
+            ${DECISION_MIN_REWARD_RISK:+-e "DECISION_MIN_REWARD_RISK=${DECISION_MIN_REWARD_RISK}"} \
+            ${DECISION_MAX_LOSS_PCT_PER_TRADE:+-e "DECISION_MAX_LOSS_PCT_PER_TRADE=${DECISION_MAX_LOSS_PCT_PER_TRADE}"} \
+            ${DECISION_ACCOUNT_RISK_PCT:+-e "DECISION_ACCOUNT_RISK_PCT=${DECISION_ACCOUNT_RISK_PCT}"} \
+            ${DECISION_MAX_POSITION_NOTIONAL_PCT:+-e "DECISION_MAX_POSITION_NOTIONAL_PCT=${DECISION_MAX_POSITION_NOTIONAL_PCT}"} \
+            ${DECISION_DEFAULT_HOLDING_DAYS:+-e "DECISION_DEFAULT_HOLDING_DAYS=${DECISION_DEFAULT_HOLDING_DAYS}"} \
+            ${DECISION_MAX_HOLDING_DAYS:+-e "DECISION_MAX_HOLDING_DAYS=${DECISION_MAX_HOLDING_DAYS}"} \
+            ${DECISION_STOP_ATR_MULTIPLE:+-e "DECISION_STOP_ATR_MULTIPLE=${DECISION_STOP_ATR_MULTIPLE}"} \
+            ${DECISION_TARGET_1_R_MULTIPLE:+-e "DECISION_TARGET_1_R_MULTIPLE=${DECISION_TARGET_1_R_MULTIPLE}"} \
+            ${DECISION_TARGET_2_R_MULTIPLE:+-e "DECISION_TARGET_2_R_MULTIPLE=${DECISION_TARGET_2_R_MULTIPLE}"} \
+            ${DECISION_MIN_BARRIER_DISTANCE_PCT:+-e "DECISION_MIN_BARRIER_DISTANCE_PCT=${DECISION_MIN_BARRIER_DISTANCE_PCT}"} \
+            ${DECISION_BARRIER_STOP_BUFFER_PCT:+-e "DECISION_BARRIER_STOP_BUFFER_PCT=${DECISION_BARRIER_STOP_BUFFER_PCT}"} \
+            ${DECISION_MAX_THETA_TO_HORIZON_PCT:+-e "DECISION_MAX_THETA_TO_HORIZON_PCT=${DECISION_MAX_THETA_TO_HORIZON_PCT}"} \
+            ${DECISION_MIN_MATURITY_DAYS:+-e "DECISION_MIN_MATURITY_DAYS=${DECISION_MIN_MATURITY_DAYS}"} \
+            ${FEE_BUY_FIXED:+-e "FEE_BUY_FIXED=${FEE_BUY_FIXED}"} \
+            ${FEE_BUY_PCT:+-e "FEE_BUY_PCT=${FEE_BUY_PCT}"} \
+            ${FEE_SELL_FIXED:+-e "FEE_SELL_FIXED=${FEE_SELL_FIXED}"} \
+            ${FEE_SELL_PCT:+-e "FEE_SELL_PCT=${FEE_SELL_PCT}"} \
+            ${FEE_DEPOSIT_FIXED:+-e "FEE_DEPOSIT_FIXED=${FEE_DEPOSIT_FIXED}"} \
+            ${FEE_DEPOSIT_PCT:+-e "FEE_DEPOSIT_PCT=${FEE_DEPOSIT_PCT}"} \
             ${ORATS_API_KEY:+-e "ORATS_API_KEY=${ORATS_API_KEY}"} \
             ${FRED_API_KEY:+-e "FRED_API_KEY=${FRED_API_KEY}"} \
             ${POLYGON_API_KEY:+-e "POLYGON_API_KEY=${POLYGON_API_KEY}"} \
@@ -292,6 +353,7 @@ cmd_opportunities() {
             "${IMAGE}"
     else
         docker run --rm \
+            -v "${PWD}/data:/app/data" \
             -e "OPPORTUNITY_UNDERLYING=${underlying}" \
             -e "UNDERLYING_TICKER=${underlying_ticker}" \
             -e "OPPORTUNITY_FORMAT=${requested_format:-table}" \
@@ -308,6 +370,37 @@ cmd_opportunities() {
             -e "POLYGON_BASE_URL=${polygon_base_url}" \
             -e "OPPORTUNITY_DEBUG=${opportunity_debug}" \
             -e "OPPORTUNITY_DEBUG_EVERY=${opportunity_debug_every}" \
+            -e "MARKET_DATA_CACHE_DIR=${cache_dir}" \
+            -e "CANDLES_RANGE=${candles_range}" \
+            -e "CANDLES_INTERVAL=${candles_interval}" \
+            -e "MARKET_DATA_REFRESH=${market_data_refresh}" \
+            -e "BROKER_FEE_PROFILE=${broker_fee_profile}" \
+            -e "FEE_ORDER_NOTIONAL=${fee_order_notional}" \
+            ${DECISION_MIN_ENTRY_EDGE_PCT:+-e "DECISION_MIN_ENTRY_EDGE_PCT=${DECISION_MIN_ENTRY_EDGE_PCT}"} \
+            ${DECISION_MIN_CONFIDENCE_SCORE:+-e "DECISION_MIN_CONFIDENCE_SCORE=${DECISION_MIN_CONFIDENCE_SCORE}"} \
+            ${DECISION_MAX_SPREAD_PCT:+-e "DECISION_MAX_SPREAD_PCT=${DECISION_MAX_SPREAD_PCT}"} \
+            ${DECISION_MIN_DATA_QUALITY_SCORE:+-e "DECISION_MIN_DATA_QUALITY_SCORE=${DECISION_MIN_DATA_QUALITY_SCORE}"} \
+            ${DECISION_MIN_LIQUIDITY_SCORE:+-e "DECISION_MIN_LIQUIDITY_SCORE=${DECISION_MIN_LIQUIDITY_SCORE}"} \
+            ${DECISION_MIN_PEER_COUNT:+-e "DECISION_MIN_PEER_COUNT=${DECISION_MIN_PEER_COUNT}"} \
+            ${DECISION_MIN_REWARD_RISK:+-e "DECISION_MIN_REWARD_RISK=${DECISION_MIN_REWARD_RISK}"} \
+            ${DECISION_MAX_LOSS_PCT_PER_TRADE:+-e "DECISION_MAX_LOSS_PCT_PER_TRADE=${DECISION_MAX_LOSS_PCT_PER_TRADE}"} \
+            ${DECISION_ACCOUNT_RISK_PCT:+-e "DECISION_ACCOUNT_RISK_PCT=${DECISION_ACCOUNT_RISK_PCT}"} \
+            ${DECISION_MAX_POSITION_NOTIONAL_PCT:+-e "DECISION_MAX_POSITION_NOTIONAL_PCT=${DECISION_MAX_POSITION_NOTIONAL_PCT}"} \
+            ${DECISION_DEFAULT_HOLDING_DAYS:+-e "DECISION_DEFAULT_HOLDING_DAYS=${DECISION_DEFAULT_HOLDING_DAYS}"} \
+            ${DECISION_MAX_HOLDING_DAYS:+-e "DECISION_MAX_HOLDING_DAYS=${DECISION_MAX_HOLDING_DAYS}"} \
+            ${DECISION_STOP_ATR_MULTIPLE:+-e "DECISION_STOP_ATR_MULTIPLE=${DECISION_STOP_ATR_MULTIPLE}"} \
+            ${DECISION_TARGET_1_R_MULTIPLE:+-e "DECISION_TARGET_1_R_MULTIPLE=${DECISION_TARGET_1_R_MULTIPLE}"} \
+            ${DECISION_TARGET_2_R_MULTIPLE:+-e "DECISION_TARGET_2_R_MULTIPLE=${DECISION_TARGET_2_R_MULTIPLE}"} \
+            ${DECISION_MIN_BARRIER_DISTANCE_PCT:+-e "DECISION_MIN_BARRIER_DISTANCE_PCT=${DECISION_MIN_BARRIER_DISTANCE_PCT}"} \
+            ${DECISION_BARRIER_STOP_BUFFER_PCT:+-e "DECISION_BARRIER_STOP_BUFFER_PCT=${DECISION_BARRIER_STOP_BUFFER_PCT}"} \
+            ${DECISION_MAX_THETA_TO_HORIZON_PCT:+-e "DECISION_MAX_THETA_TO_HORIZON_PCT=${DECISION_MAX_THETA_TO_HORIZON_PCT}"} \
+            ${DECISION_MIN_MATURITY_DAYS:+-e "DECISION_MIN_MATURITY_DAYS=${DECISION_MIN_MATURITY_DAYS}"} \
+            ${FEE_BUY_FIXED:+-e "FEE_BUY_FIXED=${FEE_BUY_FIXED}"} \
+            ${FEE_BUY_PCT:+-e "FEE_BUY_PCT=${FEE_BUY_PCT}"} \
+            ${FEE_SELL_FIXED:+-e "FEE_SELL_FIXED=${FEE_SELL_FIXED}"} \
+            ${FEE_SELL_PCT:+-e "FEE_SELL_PCT=${FEE_SELL_PCT}"} \
+            ${FEE_DEPOSIT_FIXED:+-e "FEE_DEPOSIT_FIXED=${FEE_DEPOSIT_FIXED}"} \
+            ${FEE_DEPOSIT_PCT:+-e "FEE_DEPOSIT_PCT=${FEE_DEPOSIT_PCT}"} \
             ${ORATS_API_KEY:+-e "ORATS_API_KEY=${ORATS_API_KEY}"} \
             ${FRED_API_KEY:+-e "FRED_API_KEY=${FRED_API_KEY}"} \
             ${POLYGON_API_KEY:+-e "POLYGON_API_KEY=${POLYGON_API_KEY}"} \
@@ -334,7 +427,15 @@ cmd_opportunities_csv() {
     local polygon_base_url="${POLYGON_BASE_URL:-https://api.polygon.io}"
     local opportunity_debug="${OPPORTUNITY_DEBUG:-0}"
     local opportunity_debug_every="${OPPORTUNITY_DEBUG_EVERY:-25}"
+    local cache_dir="${MARKET_DATA_CACHE_DIR:-data/cache/candles}"
+    local candles_range="${CANDLES_RANGE:-6mo}"
+    local candles_interval="${CANDLES_INTERVAL:-1d}"
+    local market_data_refresh="${MARKET_DATA_REFRESH:-0}"
+    local broker_fee_profile="${BROKER_FEE_PROFILE:-custom}"
+    local fee_order_notional="${FEE_ORDER_NOTIONAL:-1000}"
+    ensure_data_dir
     docker run --rm \
+        -v "${PWD}/data:/app/data" \
         -e "OPPORTUNITY_UNDERLYING=${underlying}" \
         -e "UNDERLYING_TICKER=${underlying_ticker}" \
         -e "OPPORTUNITY_FORMAT=csv" \
@@ -351,6 +452,37 @@ cmd_opportunities_csv() {
         -e "POLYGON_BASE_URL=${polygon_base_url}" \
         -e "OPPORTUNITY_DEBUG=${opportunity_debug}" \
         -e "OPPORTUNITY_DEBUG_EVERY=${opportunity_debug_every}" \
+        -e "MARKET_DATA_CACHE_DIR=${cache_dir}" \
+        -e "CANDLES_RANGE=${candles_range}" \
+        -e "CANDLES_INTERVAL=${candles_interval}" \
+        -e "MARKET_DATA_REFRESH=${market_data_refresh}" \
+        -e "BROKER_FEE_PROFILE=${broker_fee_profile}" \
+        -e "FEE_ORDER_NOTIONAL=${fee_order_notional}" \
+        ${DECISION_MIN_ENTRY_EDGE_PCT:+-e "DECISION_MIN_ENTRY_EDGE_PCT=${DECISION_MIN_ENTRY_EDGE_PCT}"} \
+        ${DECISION_MIN_CONFIDENCE_SCORE:+-e "DECISION_MIN_CONFIDENCE_SCORE=${DECISION_MIN_CONFIDENCE_SCORE}"} \
+        ${DECISION_MAX_SPREAD_PCT:+-e "DECISION_MAX_SPREAD_PCT=${DECISION_MAX_SPREAD_PCT}"} \
+        ${DECISION_MIN_DATA_QUALITY_SCORE:+-e "DECISION_MIN_DATA_QUALITY_SCORE=${DECISION_MIN_DATA_QUALITY_SCORE}"} \
+        ${DECISION_MIN_LIQUIDITY_SCORE:+-e "DECISION_MIN_LIQUIDITY_SCORE=${DECISION_MIN_LIQUIDITY_SCORE}"} \
+        ${DECISION_MIN_PEER_COUNT:+-e "DECISION_MIN_PEER_COUNT=${DECISION_MIN_PEER_COUNT}"} \
+        ${DECISION_MIN_REWARD_RISK:+-e "DECISION_MIN_REWARD_RISK=${DECISION_MIN_REWARD_RISK}"} \
+        ${DECISION_MAX_LOSS_PCT_PER_TRADE:+-e "DECISION_MAX_LOSS_PCT_PER_TRADE=${DECISION_MAX_LOSS_PCT_PER_TRADE}"} \
+        ${DECISION_ACCOUNT_RISK_PCT:+-e "DECISION_ACCOUNT_RISK_PCT=${DECISION_ACCOUNT_RISK_PCT}"} \
+        ${DECISION_MAX_POSITION_NOTIONAL_PCT:+-e "DECISION_MAX_POSITION_NOTIONAL_PCT=${DECISION_MAX_POSITION_NOTIONAL_PCT}"} \
+        ${DECISION_DEFAULT_HOLDING_DAYS:+-e "DECISION_DEFAULT_HOLDING_DAYS=${DECISION_DEFAULT_HOLDING_DAYS}"} \
+        ${DECISION_MAX_HOLDING_DAYS:+-e "DECISION_MAX_HOLDING_DAYS=${DECISION_MAX_HOLDING_DAYS}"} \
+        ${DECISION_STOP_ATR_MULTIPLE:+-e "DECISION_STOP_ATR_MULTIPLE=${DECISION_STOP_ATR_MULTIPLE}"} \
+        ${DECISION_TARGET_1_R_MULTIPLE:+-e "DECISION_TARGET_1_R_MULTIPLE=${DECISION_TARGET_1_R_MULTIPLE}"} \
+        ${DECISION_TARGET_2_R_MULTIPLE:+-e "DECISION_TARGET_2_R_MULTIPLE=${DECISION_TARGET_2_R_MULTIPLE}"} \
+        ${DECISION_MIN_BARRIER_DISTANCE_PCT:+-e "DECISION_MIN_BARRIER_DISTANCE_PCT=${DECISION_MIN_BARRIER_DISTANCE_PCT}"} \
+        ${DECISION_BARRIER_STOP_BUFFER_PCT:+-e "DECISION_BARRIER_STOP_BUFFER_PCT=${DECISION_BARRIER_STOP_BUFFER_PCT}"} \
+        ${DECISION_MAX_THETA_TO_HORIZON_PCT:+-e "DECISION_MAX_THETA_TO_HORIZON_PCT=${DECISION_MAX_THETA_TO_HORIZON_PCT}"} \
+        ${DECISION_MIN_MATURITY_DAYS:+-e "DECISION_MIN_MATURITY_DAYS=${DECISION_MIN_MATURITY_DAYS}"} \
+        ${FEE_BUY_FIXED:+-e "FEE_BUY_FIXED=${FEE_BUY_FIXED}"} \
+        ${FEE_BUY_PCT:+-e "FEE_BUY_PCT=${FEE_BUY_PCT}"} \
+        ${FEE_SELL_FIXED:+-e "FEE_SELL_FIXED=${FEE_SELL_FIXED}"} \
+        ${FEE_SELL_PCT:+-e "FEE_SELL_PCT=${FEE_SELL_PCT}"} \
+        ${FEE_DEPOSIT_FIXED:+-e "FEE_DEPOSIT_FIXED=${FEE_DEPOSIT_FIXED}"} \
+        ${FEE_DEPOSIT_PCT:+-e "FEE_DEPOSIT_PCT=${FEE_DEPOSIT_PCT}"} \
         ${ORATS_API_KEY:+-e "ORATS_API_KEY=${ORATS_API_KEY}"} \
         ${FRED_API_KEY:+-e "FRED_API_KEY=${FRED_API_KEY}"} \
         ${POLYGON_API_KEY:+-e "POLYGON_API_KEY=${POLYGON_API_KEY}"} \
@@ -388,6 +520,8 @@ ${BOLD}Commandes :${NC}
   ${GREEN}test-unit${NC}                    Lance les tests unitaires Rust
   ${GREEN}orats-test${NC} [ticker]          Teste ORATS avec rotation des cles API
   ${GREEN}polygon-test${NC} [ticker]        Teste Polygon avec rotation des cles API
+  ${GREEN}candles${NC} [ticker] [range] [interval] [cache|refresh]
+                               Récupère les bougies Yahoo et les garde en cache local
   ${GREEN}analyze${NC} [underlying] [spot] [limit]
                                Base triée avec spot, call/put, strike, maturité, prix
   ${GREEN}opportunities${NC} [underlying] [spot] [limit] [all|call|put]
@@ -407,6 +541,16 @@ ${BOLD}.env :${NC}
       OPPORTUNITY_REQUIRE_VALIDATED_PRICE, OPTION_RISK_FREE_RATE,
       OPTION_DIVIDEND_YIELD, OPTION_IV_SIGNAL_THRESHOLD,
       OPPORTUNITY_DEBUG, OPPORTUNITY_DEBUG_EVERY,
+      CANDLES_RANGE, CANDLES_INTERVAL, MARKET_DATA_REFRESH,
+      MARKET_DATA_CACHE_DIR,
+      DECISION_MIN_ENTRY_EDGE_PCT, DECISION_MIN_CONFIDENCE_SCORE,
+      DECISION_MAX_SPREAD_PCT, DECISION_MIN_REWARD_RISK,
+      DECISION_MAX_LOSS_PCT_PER_TRADE, DECISION_ACCOUNT_RISK_PCT,
+      DECISION_MAX_POSITION_NOTIONAL_PCT, DECISION_STOP_ATR_MULTIPLE,
+      DECISION_TARGET_1_R_MULTIPLE, DECISION_TARGET_2_R_MULTIPLE,
+      BROKER_FEE_PROFILE, FEE_ORDER_NOTIONAL, FEE_BUY_FIXED,
+      FEE_BUY_PCT, FEE_SELL_FIXED, FEE_SELL_PCT,
+      FEE_DEPOSIT_FIXED, FEE_DEPOSIT_PCT,
       ORATS_API_KEY, POLYGON_API_KEY, BROWSER.
 
 ${BOLD}Exemples :${NC}
@@ -416,6 +560,8 @@ ${BOLD}Exemples :${NC}
   $0 test-unit
   $0 orats-test RMS.PA
   $0 polygon-test RMS.PA
+  $0 candles RMS.PA 6mo 1d cache
+  $0 candles RMS.PA 6mo 1d refresh
   $0 discover hermes 20
   $0 analyze hermes RMS.PA 50
   $0 opportunities hermes RMS.PA 500 call
@@ -440,6 +586,7 @@ case "${1:-help}" in
     test-unit) cmd_test_unit ;;
     orats-test) cmd_orats_test "${2:-}" ;;
     polygon-test) cmd_polygon_test "${2:-}" ;;
+    candles) cmd_candles "${2:-}" "${3:-}" "${4:-}" "${5:-}" ;;
     discover) cmd_discover "${2:-}" "${3:-}" ;;
     analyze) cmd_analyze "${2:-}" "${3:-}" "${4:-}" ;;
     opportunities) cmd_opportunities "${2:-}" "${3:-}" "${4:-}" "${5:-}" ;;

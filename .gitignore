@@ -12,3 +12,6 @@ target/
 Thumbs.db
 
 docker-compose.override.yml
+
+data/cache/
+!data/.gitkeep

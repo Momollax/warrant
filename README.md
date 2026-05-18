@@ -15,6 +15,8 @@ Commandes utiles:
 ./manage.sh opportunities hermes RMS.PA 500
 ./manage.sh opportunities hermes RMS.PA 500 call
 ./manage.sh opportunities-csv hermes RMS.PA 500 put
+./manage.sh candles RMS.PA 6mo 1d cache
+./manage.sh test-unit
 ```
 
 Enrichissement optionnel Boursorama:
@@ -24,3 +26,5 @@ BOURSORAMA_ENRICH=1 ./manage.sh analyze hermes RMS.PA 50
 ```
 
 Les signaux produits sont des indicateurs d'analyse, pas des recommandations d'investissement.
+
+Le moteur `opportunities` calcule maintenant `BUY/WATCH/AVOID`, stop, targets, reward/risk, sizing de position, risque temps/theta quand disponible, et utilise les bougies cachees pour ATR/support/resistance.

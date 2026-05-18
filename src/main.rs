@@ -1,6 +1,8 @@
 mod analysis;
 mod api;
 mod config;
+#[allow(dead_code)]
+mod decision;
 mod display;
 mod indicators;
 mod models;
@@ -15,11 +17,16 @@ use anyhow::Result;
 use analysis::build_market_base;
 use api::boursorama::fetch_boursorama_quote_for_product;
 use api::boursorama_discover::discover_boursorama_by_underlying;
+use api::candle_cache::{candle_cache_path, load_or_fetch_candles, CacheMode};
 use api::client::build_client;
 use api::discover::discover_by_underlying;
 use api::orats::OratsClient;
 use api::polygon::PolygonClient;
 use config::{resolve_max_cycles, resolve_tickers, REFRESH_INTERVAL_SECS};
+use decision::config::DecisionConfig;
+use decision::market_indicators::compute_market_indicators;
+use decision::models::{DecisionAction, DecisionSignal, MarketContext};
+use decision::trade_plan::build_trade_plan;
 use futures::{stream, StreamExt};
 use indicators::warrant::{rank_relative_value, OpportunitySignal, ValuationSide};
 use models::euronext::EuronextProduct;
@@ -60,6 +67,13 @@ async fn main() -> Result<()> {
         let ticker = args.get(2).map(String::as_str).unwrap_or("RMS.PA");
         return run_polygon_test(ticker).await;
     }
+    if args.get(1).is_some_and(|arg| arg == "candles") {
+        let ticker = args.get(2).map(String::as_str).unwrap_or("RMS.PA");
+        let range = args.get(3).map(String::as_str).unwrap_or("6mo");
+        let interval = args.get(4).map(String::as_str).unwrap_or("1d");
+        let mode = args.get(5).map(String::as_str).unwrap_or("cache");
+        return run_candles(ticker, range, interval, mode).await;
+    }
 
     if let Ok(underlying) = std::env::var("DISCOVER_UNDERLYING") {
         let limit = std::env::var("DISCOVER_LIMIT")
@@ -89,6 +103,14 @@ async fn main() -> Result<()> {
     }
     if let Ok(ticker) = std::env::var("POLYGON_TEST_TICKER") {
         return run_polygon_test(&ticker).await;
+    }
+    if let Ok(ticker) = std::env::var("CANDLES_TICKER") {
+        let range = std::env::var("CANDLES_RANGE").unwrap_or_else(|_| "6mo".to_string());
+        let interval = std::env::var("CANDLES_INTERVAL").unwrap_or_else(|_| "1d".to_string());
+        let mode = std::env::var("CANDLES_MODE")
+            .or_else(|_| std::env::var("MARKET_DATA_REFRESH"))
+            .unwrap_or_else(|_| "cache".to_string());
+        return run_candles(&ticker, &range, &interval, &mode).await;
     }
 
     let tickers = resolve_tickers();
@@ -122,6 +144,57 @@ async fn run_orats_test(ticker: &str) -> Result<()> {
         .unwrap_or(0);
     println!("orats_ticker,row_count");
     println!("{ticker},{row_count}");
+    Ok(())
+}
+
+async fn run_candles(ticker: &str, range: &str, interval: &str, mode: &str) -> Result<()> {
+    let client = build_client()?;
+    let cache_dir = std::env::var("MARKET_DATA_CACHE_DIR")
+        .unwrap_or_else(|_| "data/cache/candles".to_string());
+    let cache_mode = CacheMode::from_str(mode);
+    let cache_path = candle_cache_path(std::path::Path::new(&cache_dir), ticker, range, interval);
+    let data_source = if cache_mode == CacheMode::UseCache && cache_path.exists() {
+        "cache"
+    } else {
+        "network"
+    };
+    let series = load_or_fetch_candles(
+        &client,
+        ticker,
+        range,
+        interval,
+        std::path::Path::new(&cache_dir),
+        cache_mode,
+    )
+    .await?;
+
+    eprintln!(
+        "[INFO] Bougies {} {} {}: {} ligne(s), data {}, source {}, cache {}",
+        series.ticker,
+        series.range,
+        series.interval,
+        series.candles.len(),
+        data_source,
+        series.source,
+        cache_dir
+    );
+    println!("ticker,currency,range,interval,timestamp,open,high,low,close,volume");
+    for candle in &series.candles {
+        println!(
+            "{},{},{},{},{},{:.6},{:.6},{:.6},{:.6},{}",
+            csv_escape(&series.ticker),
+            csv_escape(&series.currency),
+            csv_escape(&series.range),
+            csv_escape(&series.interval),
+            candle.timestamp,
+            candle.open,
+            candle.high,
+            candle.low,
+            candle.close,
+            candle.volume
+        );
+    }
+
     Ok(())
 }
 
@@ -232,20 +305,24 @@ async fn run_opportunities(
         );
     }
     let format = std::env::var("OPPORTUNITY_FORMAT").unwrap_or_default();
+    let market_context = build_decision_market_context(&client, &base).await;
+    let decision_config = DecisionConfig::from_env();
+    let mut decision_signals = build_decision_signals(&signals, &market_context, &decision_config);
+    sort_decision_signals(&mut decision_signals);
 
-    let filtered_signals = filter_opportunity_signals(&signals, side_filter);
+    let filtered_signals = filter_decision_signals(&decision_signals, side_filter);
     trace::log(format!(
         "opportunities: display format={} filtered={} total={}",
         if format.is_empty() { "auto" } else { &format },
         filtered_signals.len(),
-        signals.len()
+        decision_signals.len()
     ));
 
     if format == "tui" && io::stdout().is_terminal() {
         return display::opportunities::run(
             &base.underlying_quote,
             base.products.len(),
-            &signals,
+            &decision_signals,
             side_filter,
         );
     }
@@ -253,7 +330,7 @@ async fn run_opportunities(
     print_opportunity_summary(
         &base.underlying_quote,
         base.products.len(),
-        signals.len(),
+        decision_signals.len(),
         filtered_signals.len(),
         side_filter,
     );
@@ -265,6 +342,113 @@ async fn run_opportunities(
     }
 
     Ok(())
+}
+
+async fn build_decision_market_context(
+    client: &reqwest::Client,
+    base: &analysis::MarketBase,
+) -> MarketContext {
+    let cache_dir = std::env::var("MARKET_DATA_CACHE_DIR")
+        .unwrap_or_else(|_| "data/cache/candles".to_string());
+    let range = std::env::var("CANDLES_RANGE").unwrap_or_else(|_| "6mo".to_string());
+    let interval = std::env::var("CANDLES_INTERVAL").unwrap_or_else(|_| "1d".to_string());
+    let mode = std::env::var("MARKET_DATA_REFRESH")
+        .or_else(|_| std::env::var("CANDLES_MODE"))
+        .unwrap_or_else(|_| "cache".to_string());
+    let cache_mode = CacheMode::from_str(&mode);
+    let indicators = match load_or_fetch_candles(
+        client,
+        &base.underlying_quote.ticker,
+        &range,
+        &interval,
+        std::path::Path::new(&cache_dir),
+        cache_mode,
+    )
+    .await
+    {
+        Ok(series) => {
+            trace::log(format!(
+                "market indicators: candles loaded ticker={} rows={} range={} interval={}",
+                series.ticker,
+                series.candles.len(),
+                series.range,
+                series.interval
+            ));
+            compute_market_indicators(&series)
+        }
+        Err(err) => {
+            eprintln!(
+                "[WARN] Bougies indisponibles pour {}: {err:#}. Stops/targets utilisent les fallbacks.",
+                base.underlying_quote.ticker
+            );
+            Default::default()
+        }
+    };
+
+    MarketContext {
+        underlying_ticker: base.underlying_quote.ticker.clone(),
+        spot: base.underlying_quote.price,
+        spot_currency: base.underlying_quote.currency.clone(),
+        change_pct: base.underlying_quote.change_pct,
+        fx_rates: base.fx_rates.clone(),
+        realized_volatility_20d: indicators.realized_volatility_20d,
+        atr_14d: indicators.atr_14d,
+        support_1: indicators.support_1,
+        support_2: indicators.support_2,
+        resistance_1: indicators.resistance_1,
+        resistance_2: indicators.resistance_2,
+        risk_free_rate: read_env_f64("OPTION_RISK_FREE_RATE").unwrap_or(0.045),
+        dividend_yield: read_env_f64("OPTION_DIVIDEND_YIELD").unwrap_or(0.005),
+    }
+}
+
+fn build_decision_signals(
+    signals: &[OpportunitySignal],
+    market: &MarketContext,
+    config: &DecisionConfig,
+) -> Vec<DecisionSignal> {
+    signals
+        .iter()
+        .map(|signal| build_trade_plan(signal, market, config))
+        .collect()
+}
+
+fn sort_decision_signals(signals: &mut [DecisionSignal]) {
+    signals.sort_by(|left, right| {
+        decision_rank(left.decision)
+            .cmp(&decision_rank(right.decision))
+            .then_with(|| {
+                confidence(right)
+                    .partial_cmp(&confidence(left))
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
+            .then_with(|| {
+                right
+                    .opportunity
+                    .score
+                    .partial_cmp(&left.opportunity.score)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
+            .then_with(|| left.opportunity.symbol.cmp(&right.opportunity.symbol))
+    });
+}
+
+fn decision_rank(decision: DecisionAction) -> u8 {
+    match decision {
+        DecisionAction::BuyCandidate => 0,
+        DecisionAction::Watch | DecisionAction::Hold => 1,
+        DecisionAction::TakeProfit => 2,
+        DecisionAction::ExitLoss => 3,
+        DecisionAction::Avoid => 4,
+    }
+}
+
+fn confidence(signal: &DecisionSignal) -> f64 {
+    signal
+        .trade_plan
+        .as_ref()
+        .map(|plan| plan.confidence_score)
+        .unwrap_or(0.0)
 }
 
 async fn validate_opportunity_candidates(
@@ -463,16 +647,16 @@ fn print_opportunity_summary(
     );
 }
 
-fn print_opportunity_table(signals: &[&OpportunitySignal]) {
+fn print_opportunity_table(signals: &[&DecisionSignal]) {
     print_rank_section(
-        "Top 10 sous-evalues vs pairs",
+        "Top 10 plans sous-evalues",
         signals,
         ValuationSide::Undervalued,
         10,
     );
     println!();
     print_rank_section(
-        "Top 10 sur-evalues vs pairs",
+        "Top 10 plans sur-evalues",
         signals,
         ValuationSide::Overvalued,
         10,
@@ -481,53 +665,48 @@ fn print_opportunity_table(signals: &[&OpportunitySignal]) {
 
 fn print_rank_section(
     title: &str,
-    signals: &[&OpportunitySignal],
+    signals: &[&DecisionSignal],
     valuation: ValuationSide,
     limit: usize,
 ) {
     println!("{title}");
     println!(
-        "{:<7} {:<7} {:<8} {:<5} {:<24} {:<10} {:>10} {:>7} {:>5} {:>7} {:>10} {:>8} {:>9} {:>9} {:>9} {:>6}",
-        "edge", "gap", "symbol", "side", "type", "maturity", "price", "spr%", "dq", "iv", "ref", "parity", "intr/w", "metric", "median", "peers"
+        "{:<6} {:>5} {:>7} {:>6} {:>7} {:>7} {:>7} {:>7} {:>6} {:>6} {:>6} {:>5} {:>5} {:<8} {:<5} {:<22} {:<10} {:>10}",
+        "dec", "conf", "edge", "rr2", "size%", "stop%", "t1%", "t2%", "be%", "fee%", "spr%", "dq", "liq", "symbol", "side", "type", "maturity", "price"
     );
-    println!("{}", "-".repeat(158));
+    println!("{}", "-".repeat(150));
 
     let mut printed = 0usize;
-    for signal in signals
+    for decision in signals
         .iter()
         .copied()
-        .filter(|signal| signal.valuation == valuation)
+        .filter(|decision| decision.opportunity.valuation == valuation)
         .take(limit)
     {
+        let signal = &decision.opportunity;
+        let plan = decision.trade_plan.as_ref();
         printed += 1;
         println!(
-            "{:>+6.1}% {:>+6.1}% {:<8} {:<5} {:<24} {:<10} {:>4} {:>5.4} {:>7} {:>5.0} {:>7} {:>10.2} {:>8} {:>9.4} {:>9.4} {:>9.4} {:>6}",
+            "{:<6} {:>5} {:>+6.1}% {:>6} {:>7} {:>7} {:>7} {:>7} {:>6} {:>6} {:>6} {:>5.0} {:>5.0} {:<8} {:<5} {:<22} {:<10} {:>4} {:>5.4}",
+            decision_action_label(decision.decision),
+            plan.map(|plan| format!("{:.0}", plan.confidence_score)).unwrap_or_else(|| "-".to_string()),
             signal.spread_adjusted_gap_pct,
-            signal.peer_gap_pct,
+            plan.and_then(|plan| plan.reward_risk_2).map(|value| format!("{value:.2}")).unwrap_or_else(|| "-".to_string()),
+            plan.map(|plan| format!("{:.1}", plan.position.suggested_notional_pct)).unwrap_or_else(|| "-".to_string()),
+            plan.map(|plan| format!("{:.1}", plan.stop.loss_pct)).unwrap_or_else(|| "-".to_string()),
+            plan.map(|plan| format!("{:+.1}", plan.target_1.gain_pct)).unwrap_or_else(|| "-".to_string()),
+            plan.map(|plan| format!("{:+.1}", plan.target_2.gain_pct)).unwrap_or_else(|| "-".to_string()),
+            plan.and_then(|plan| plan.breakeven_move_pct).map(|value| format!("{value:.2}")).unwrap_or_else(|| "-".to_string()),
+            plan.map(|plan| format!("{:.2}", plan.fees.roundtrip_target_2_fee_pct)).unwrap_or_else(|| "-".to_string()),
+            signal.spread_pct.map(|value| format!("{value:.2}")).unwrap_or_else(|| "-".to_string()),
+            signal.data_quality_score,
+            signal.liquidity_score,
             signal.symbol,
             signal.side,
-            truncate_display(&signal.product_type, 24),
+            truncate_display(&signal.product_type, 22),
             signal.maturity,
             signal.price_currency,
-            signal.last_price,
-            signal
-                .spread_pct
-                .map(|value| format!("{value:.2}"))
-                .unwrap_or_else(|| "-".to_string()),
-            signal.data_quality_score,
-            signal
-                .implied_volatility
-                .map(|value| format!("{:.1}%", value * 100.0))
-                .unwrap_or_else(|| "-".to_string()),
-            signal.strike,
-            signal
-                .warrants_per_underlying
-                .map(format_compact_float)
-                .unwrap_or_else(|| "?".to_string()),
-            signal.intrinsic_per_product,
-            signal.relative_metric,
-            signal.peer_median_relative_metric,
-            signal.peer_count
+            signal.last_price
         );
     }
 
@@ -538,29 +717,29 @@ fn print_rank_section(
 
 fn print_opportunity_csv(
     underlying: &models::warrant::WarrantSnapshot,
-    signals: &[&OpportunitySignal],
+    signals: &[&DecisionSignal],
 ) {
     println!(
-        "underlying_ticker,underlying_price,valuation,side,moneyness,symbol,boursorama_url,product_family,pricing_model,product_type,maturity,price_currency,last_price,price_source,bid_price,ask_price,mid_price,spread_pct,bid_size,ask_size,quote_volume,execution_status,data_quality_score,liquidity_score,payoff_reference,payoff_reference_currency,barrier,barrier_currency,barrier_distance_pct,raw_intrinsic,intrinsic_per_product,intrinsic_currency,fx_rate,fx_source_ticker,warrants_per_underlying,price_to_intrinsic,effective_gearing,premium_discount_pct,years_to_maturity,risk_free_rate,dividend_yield,implied_volatility,smile_median_iv,smile_gap_vol_points,volatility_signal,metric_kind,relative_metric,peer_median_relative_metric,peer_gap_pct,spread_adjusted_gap_pct,peer_count,score,note"
+        "underlying_ticker,underlying_price,decision,decision_reasons,decision_warnings,confidence_score,entry_price,entry_price_source,underlying_entry_price,entry_edge_pct,breakeven_move_pct,underlying_stop_price,product_stop_price,stop_loss_pct,distance_to_stop_pct,stop_reason,target_1_underlying_price,target_1_product_price,target_1_gain_pct,target_1_distance_pct,target_2_underlying_price,target_2_product_price,target_2_gain_pct,target_2_distance_pct,reward_risk_1,reward_risk_2,holding_days,max_holding_days,maturity_days,theta_daily_pct,theta_to_horizon_pct,time_risk_score,barrier_risk_score,spread_cost_underlying_pct,account_risk_pct,suggested_position_notional_pct,max_position_notional_pct,estimated_account_loss_pct,products_per_1000_account,fee_profile,fee_order_notional,fee_buy,fee_deposit,fee_sell_stop,fee_sell_target_1,fee_sell_target_2,fee_roundtrip_stop_pct,fee_roundtrip_target_1_pct,fee_roundtrip_target_2_pct,raw_stop_loss_pct,raw_target_1_gain_pct,raw_target_2_gain_pct,valuation,side,moneyness,symbol,boursorama_url,product_family,pricing_model,product_type,maturity,price_currency,last_price,price_source,bid_price,ask_price,mid_price,spread_pct,bid_size,ask_size,quote_volume,execution_status,data_quality_score,liquidity_score,payoff_reference,payoff_reference_currency,barrier,barrier_currency,barrier_distance_pct,raw_intrinsic,intrinsic_per_product,intrinsic_currency,fx_rate,fx_source_ticker,warrants_per_underlying,price_to_intrinsic,effective_gearing,premium_discount_pct,years_to_maturity,risk_free_rate,dividend_yield,implied_volatility,smile_median_iv,smile_gap_vol_points,volatility_signal,metric_kind,relative_metric,peer_median_relative_metric,peer_gap_pct,spread_adjusted_gap_pct,peer_count,score,note"
     );
-    for signal in signals {
+    for decision in signals {
         println!(
             "{}",
-            opportunity_signal_to_csv(underlying, signal)
+            decision_signal_to_csv(underlying, decision)
         );
     }
 }
 
-fn filter_opportunity_signals<'a>(
-    signals: &'a [OpportunitySignal],
+fn filter_decision_signals<'a>(
+    signals: &'a [DecisionSignal],
     side_filter: &str,
-) -> Vec<&'a OpportunitySignal> {
+) -> Vec<&'a DecisionSignal> {
     let side_filter = normalize_side_filter(side_filter);
     signals
         .iter()
         .filter(|signal| match side_filter {
-            "call" => signal.side == "call",
-            "put" => signal.side == "put",
+            "call" => signal.opportunity.side == "call",
+            "put" => signal.opportunity.side == "put",
             _ => true,
         })
         .collect()
@@ -854,13 +1033,76 @@ fn structured_product_to_csv(
     .join(",")
 }
 
-fn opportunity_signal_to_csv(
+fn decision_signal_to_csv(
     underlying: &models::warrant::WarrantSnapshot,
-    signal: &OpportunitySignal,
+    decision: &DecisionSignal,
 ) -> String {
-    [
+    let signal = &decision.opportunity;
+    let plan = decision.trade_plan.as_ref();
+    let mut fields = vec![
         underlying.ticker.as_str().to_string(),
         format_float(underlying.price),
+        decision_action_label(decision.decision).to_string(),
+        decision.reasons.join("|"),
+        decision.warnings.join("|"),
+        plan.map(|plan| format_float(plan.confidence_score)).unwrap_or_default(),
+        plan.map(|plan| format_float(plan.entry_price)).unwrap_or_default(),
+        plan.map(|plan| plan.entry_price_source.clone()).unwrap_or_default(),
+        plan.map(|plan| format_float(plan.entry_underlying_price)).unwrap_or_default(),
+        plan.map(|plan| format_float(plan.entry_edge_pct)).unwrap_or_default(),
+        plan.and_then(|plan| plan.breakeven_move_pct).map(format_float).unwrap_or_default(),
+        plan.map(|plan| format_float(plan.stop.underlying_stop_price)).unwrap_or_default(),
+        plan.map(|plan| format_float(plan.stop.estimated_product_stop_price)).unwrap_or_default(),
+        plan.map(|plan| format_float(plan.stop.loss_pct)).unwrap_or_default(),
+        plan.map(|plan| format_float(plan.stop.distance_to_stop_pct)).unwrap_or_default(),
+        plan.map(|plan| format!("{:?}", plan.stop.stop_reason)).unwrap_or_default(),
+        plan.map(|plan| format_float(plan.target_1.underlying_target_price)).unwrap_or_default(),
+        plan.map(|plan| format_float(plan.target_1.estimated_product_target_price)).unwrap_or_default(),
+        plan.map(|plan| format_float(plan.target_1.gain_pct)).unwrap_or_default(),
+        plan.map(|plan| format_float(plan.target_1.distance_to_target_pct)).unwrap_or_default(),
+        plan.map(|plan| format_float(plan.target_2.underlying_target_price)).unwrap_or_default(),
+        plan.map(|plan| format_float(plan.target_2.estimated_product_target_price)).unwrap_or_default(),
+        plan.map(|plan| format_float(plan.target_2.gain_pct)).unwrap_or_default(),
+        plan.map(|plan| format_float(plan.target_2.distance_to_target_pct)).unwrap_or_default(),
+        plan.and_then(|plan| plan.reward_risk_1).map(format_float).unwrap_or_default(),
+        plan.and_then(|plan| plan.reward_risk_2).map(format_float).unwrap_or_default(),
+        plan.map(|plan| plan.horizon.holding_days.to_string()).unwrap_or_default(),
+        plan.map(|plan| plan.horizon.max_holding_days.to_string()).unwrap_or_default(),
+        plan.and_then(|plan| plan.horizon.maturity_days).map(|value| value.to_string()).unwrap_or_default(),
+        plan.and_then(|plan| plan.horizon.theta_daily_pct).map(format_float).unwrap_or_default(),
+        plan.and_then(|plan| plan.horizon.theta_to_horizon_pct).map(format_float).unwrap_or_default(),
+        plan.map(|plan| format_float(plan.horizon.time_risk_score)).unwrap_or_default(),
+        plan.and_then(|plan| plan.risk.barrier_risk_score).map(format_float).unwrap_or_default(),
+        plan.and_then(|plan| plan.risk.spread_cost_underlying_pct).map(format_float).unwrap_or_default(),
+        plan.map(|plan| format_float(plan.position.account_risk_pct)).unwrap_or_default(),
+        plan.map(|plan| format_float(plan.position.suggested_notional_pct)).unwrap_or_default(),
+        plan.map(|plan| format_float(plan.position.max_notional_pct)).unwrap_or_default(),
+        plan.map(|plan| format_float(plan.position.estimated_account_loss_pct)).unwrap_or_default(),
+        plan.and_then(|plan| plan.position.products_per_1000_account).map(format_float).unwrap_or_default(),
+        plan.map(|plan| plan.fees.profile.clone()).unwrap_or_default(),
+        plan.map(|plan| format_float(plan.fees.order_notional)).unwrap_or_default(),
+        plan.map(|plan| format_float(plan.fees.buy_fee)).unwrap_or_default(),
+        plan.map(|plan| format_float(plan.fees.deposit_fee)).unwrap_or_default(),
+        plan.map(|plan| format_float(plan.fees.sell_stop_fee)).unwrap_or_default(),
+        plan.map(|plan| format_float(plan.fees.sell_target_1_fee)).unwrap_or_default(),
+        plan.map(|plan| format_float(plan.fees.sell_target_2_fee)).unwrap_or_default(),
+        plan.map(|plan| format_float(plan.fees.roundtrip_stop_fee_pct)).unwrap_or_default(),
+        plan.map(|plan| format_float(plan.fees.roundtrip_target_1_fee_pct)).unwrap_or_default(),
+        plan.map(|plan| format_float(plan.fees.roundtrip_target_2_fee_pct)).unwrap_or_default(),
+        plan.map(|plan| format_float(plan.fees.raw_stop_loss_pct)).unwrap_or_default(),
+        plan.map(|plan| format_float(plan.fees.raw_target_1_gain_pct)).unwrap_or_default(),
+        plan.map(|plan| format_float(plan.fees.raw_target_2_gain_pct)).unwrap_or_default(),
+    ];
+    fields.extend(opportunity_signal_fields(signal));
+    fields
+        .into_iter()
+        .map(|value| csv_escape(&value))
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+fn opportunity_signal_fields(signal: &OpportunitySignal) -> Vec<String> {
+    vec![
         signal.valuation.as_str().to_string(),
         signal.side.as_str().to_string(),
         signal.moneyness.as_str().to_string(),
@@ -916,10 +1158,6 @@ fn opportunity_signal_to_csv(
         format_float(signal.score),
         signal.note.as_str().to_string(),
     ]
-    .into_iter()
-    .map(|value| csv_escape(&value))
-    .collect::<Vec<_>>()
-    .join(",")
 }
 
 fn default_underlying_ticker(underlying: &str) -> &'static str {
@@ -929,16 +1167,26 @@ fn default_underlying_ticker(underlying: &str) -> &'static str {
     }
 }
 
-fn format_float(value: f64) -> String {
-    format!("{value:.4}")
+fn decision_action_label(decision: DecisionAction) -> &'static str {
+    match decision {
+        DecisionAction::BuyCandidate => "BUY",
+        DecisionAction::Watch => "WATCH",
+        DecisionAction::Avoid => "AVOID",
+        DecisionAction::ExitLoss => "EXIT",
+        DecisionAction::TakeProfit => "TAKE",
+        DecisionAction::Hold => "HOLD",
+    }
 }
 
-fn format_compact_float(value: f64) -> String {
-    if value.fract().abs() < f64::EPSILON {
-        format!("{value:.0}")
-    } else {
-        format!("{value:.4}")
-    }
+fn read_env_f64(name: &str) -> Option<f64> {
+    std::env::var(name)
+        .ok()
+        .and_then(|value| value.parse::<f64>().ok())
+        .filter(|value| value.is_finite())
+}
+
+fn format_float(value: f64) -> String {
+    format!("{value:.4}")
 }
 
 fn boursorama_mid(quote: Option<&models::structured::BoursoramaQuote>) -> Option<f64> {

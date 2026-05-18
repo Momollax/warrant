@@ -38,6 +38,36 @@ pub fn black_scholes_price(input: BlackScholesInput) -> Option<f64> {
     price.is_finite().then_some(price.max(0.0))
 }
 
+pub fn black_scholes_theta_per_year(input: BlackScholesInput) -> Option<f64> {
+    validate_positive(input.spot)?;
+    validate_positive(input.strike)?;
+    validate_positive(input.years_to_maturity)?;
+    validate_positive(input.volatility)?;
+
+    let sqrt_t = input.years_to_maturity.sqrt();
+    let d1 = ((input.spot / input.strike).ln()
+        + (input.risk_free_rate - input.dividend_yield + 0.5 * input.volatility.powi(2))
+            * input.years_to_maturity)
+        / (input.volatility * sqrt_t);
+    let d2 = d1 - input.volatility * sqrt_t;
+    let discounted_spot = input.spot * (-input.dividend_yield * input.years_to_maturity).exp();
+    let discounted_strike = input.strike * (-input.risk_free_rate * input.years_to_maturity).exp();
+    let diffusion = -(discounted_spot * normal_pdf(d1) * input.volatility) / (2.0 * sqrt_t);
+
+    let theta = match input.kind {
+        OptionKind::Call => {
+            diffusion - input.risk_free_rate * discounted_strike * normal_cdf(d2)
+                + input.dividend_yield * discounted_spot * normal_cdf(d1)
+        }
+        OptionKind::Put => {
+            diffusion + input.risk_free_rate * discounted_strike * normal_cdf(-d2)
+                - input.dividend_yield * discounted_spot * normal_cdf(-d1)
+        }
+    };
+
+    theta.is_finite().then_some(theta)
+}
+
 pub fn implied_volatility(
     kind: OptionKind,
     market_price: f64,
@@ -142,6 +172,10 @@ fn normal_cdf(x: f64) -> f64 {
     0.5 * (1.0 + sign * erf(z))
 }
 
+fn normal_pdf(x: f64) -> f64 {
+    (-0.5 * x * x).exp() / (2.0 * std::f64::consts::PI).sqrt()
+}
+
 fn erf(x: f64) -> f64 {
     let a1 = 0.254829592;
     let a2 = -0.284496736;
@@ -198,6 +232,22 @@ mod tests {
             .unwrap();
 
         assert_close(iv, 0.35, 1e-4);
+    }
+
+    #[test]
+    fn black_scholes_theta_is_negative_for_atm_call() {
+        let theta = black_scholes_theta_per_year(BlackScholesInput {
+            kind: OptionKind::Call,
+            spot: 100.0,
+            strike: 100.0,
+            years_to_maturity: 1.0,
+            risk_free_rate: 0.05,
+            dividend_yield: 0.0,
+            volatility: 0.20,
+        })
+        .unwrap();
+
+        assert!(theta < 0.0, "theta={theta}");
     }
 
     #[test]

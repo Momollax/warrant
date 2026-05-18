@@ -219,6 +219,137 @@ Exporter les opportunites en CSV:
 ./manage.sh opportunities-csv hermes RMS.PA 500 all
 ```
 
+Recuperer les bougies avec cache local:
+
+```bash
+./manage.sh candles RMS.PA 6mo 1d cache
+./manage.sh candles RMS.PA 6mo 1d refresh
+```
+
+Lancer les tests unitaires:
+
+```bash
+./manage.sh test-unit
+```
+
+## Moteur de decision actuel
+
+La commande `opportunities` ne se limite plus au gap relatif. Elle construit maintenant un `DecisionSignal`:
+
+```text
+OpportunitySignal
+  -> stop sous-jacent
+  -> projection prix produit au stop
+  -> targets T1/T2
+  -> reward/risk
+  -> horizon / theta
+  -> sizing position
+  -> decision BUY / WATCH / AVOID
+```
+
+Les garde-fous principaux sont:
+
+- pas d'entree si `bid/ask` non executable;
+- pas d'entree si `ask == 0`, `bid == 0` ou `ask < bid`;
+- pas d'entree si le prix vient de `last_unverified`;
+- pas d'entree si la parite manque;
+- pas d'entree si le spread depasse `DECISION_MAX_SPREAD_PCT`;
+- pas d'entree si la maturite est inferieure a `DECISION_MIN_MATURITY_DAYS`;
+- pas d'entree si la barriere est trop proche;
+- pas d'entree si le stop ou la target ne peuvent pas etre projetes.
+
+### Colonnes de decision
+
+| Colonne | Sens |
+| --- | --- |
+| `Dec` | `BUY`, `WATCH` ou `AVOID`. |
+| `Conf` | Score global pondere par data, liquidite, spread, pairs, edge, R/R, barriere et temps. |
+| `Edge` | Gap relatif net du spread. |
+| `R/R` | Reward/risk sur la target 2. |
+| `Size` / `size%` | Pourcentage de capital suggere par le module de sizing. |
+| `Stop` / `stop%` | Perte estimee si le stop sous-jacent est touche. |
+| `T1`, `T2` | Gains estimes aux objectifs 1 et 2. |
+| `BE` | Mouvement minimal du sous-jacent pour absorber le spread. |
+| `DQ` | Qualite de donnee apres nettoyage bid/ask/timestamp/statut. |
+| `Liq` | Score de liquidite base sur spread, tailles et volume quand disponible. |
+| `IV`, `IVd` | IV et ecart au smile si disponibles, surtout pour warrants. |
+
+### Sizing position
+
+Le sizing part du risque maximal accepte sur le compte.
+
+Variables:
+
+```text
+DECISION_ACCOUNT_RISK_PCT=1
+DECISION_MAX_POSITION_NOTIONAL_PCT=10
+```
+
+Formule:
+
+```text
+taille_position_% = min(
+  DECISION_ACCOUNT_RISK_PCT / stop_loss_pct * 100,
+  DECISION_MAX_POSITION_NOTIONAL_PCT
+)
+```
+
+Exemple:
+
+```text
+stop_loss_pct = 20%
+risque compte = 1%
+taille = 1 / 20 * 100 = 5% du capital
+```
+
+Le CSV expose aussi `products_per_1000_account`, qui donne le nombre de produits approximatif pour 1000 unites de capital.
+
+### Horizon et theta
+
+Pour les turbos et mini-futures, le moteur ne calcule pas de theta Black-Scholes, car leur cout principal vient plutot du financement, du spread et de la barriere.
+
+Pour les warrants avec IV disponible:
+
+```text
+theta_daily_pct = max(0, -theta_black_scholes_journalier / prix_entree) * 100
+theta_to_horizon_pct = theta_daily_pct * holding_days
+```
+
+Regles:
+
+- si `theta_to_horizon_pct > DECISION_MAX_THETA_TO_HORIZON_PCT`, le signal est degrade en `WATCH`;
+- si `theta_to_horizon_pct > 2 * DECISION_MAX_THETA_TO_HORIZON_PCT`, le signal passe en `AVOID`;
+- si la maturite restante est trop courte, le signal passe en `AVOID`.
+
+### Bougies et cache
+
+Les bougies du sous-jacent sont recuperees via Yahoo puis sauvegardees dans:
+
+```text
+data/cache/candles
+```
+
+Par defaut, le moteur utilise le cache quand il existe:
+
+```text
+CANDLES_MODE=cache
+MARKET_DATA_REFRESH=0
+```
+
+Pour forcer une mise a jour:
+
+```bash
+MARKET_DATA_REFRESH=refresh ./manage.sh opportunities hermes RMS.PA 500 all
+```
+
+Ces bougies alimentent:
+
+- `ATR 14`;
+- volatilite realisee 20 jours;
+- support proche;
+- resistance proche;
+- stops et targets sur plusieurs semaines.
+
 ## Modele de donnees logique
 
 Chaque produit est normalise en `StructuredProduct`.
@@ -729,3 +860,72 @@ Nouveaux champs exportes dans `opportunities-csv` et affiches dans Ratatui:
 - `smile_median_iv`;
 - `smile_gap_vol_points`;
 - `volatility_signal`.
+
+## Frais broker et rendement net
+
+Le moteur de decision integre maintenant une couche de frais explicite avant de calculer le `R/R`, la taille de position et les stop/targets affiches.
+
+Pipeline:
+
+```text
+prix entree ask executable
+  -> projection stop/targets bruts
+  -> frais achat + depot + vente stop/T1/T2
+  -> stop/targets nets de frais
+  -> reward/risk net
+  -> sizing et decision BUY/WATCH/AVOID
+```
+
+Variables `.env`:
+
+```text
+BROKER_FEE_PROFILE=custom
+FEE_ORDER_NOTIONAL=1000
+FEE_BUY_FIXED=
+FEE_BUY_PCT=
+FEE_SELL_FIXED=
+FEE_SELL_PCT=
+FEE_DEPOSIT_FIXED=
+FEE_DEPOSIT_PCT=
+```
+
+Les variables `FEE_*` doivent rester vides pour utiliser les valeurs du profil `BROKER_FEE_PROFILE`. Si `FEE_BUY_FIXED=0` est renseigne explicitement, cela veut dire "forcer le frais d'achat a 0" et cela ecrase donc le profil.
+
+Profils integres:
+
+| Profil | Logique |
+| --- | --- |
+| `custom` | Aucun frais par defaut; les variables `FEE_*` prennent le relais. |
+| `trade_republic` | 1 EUR a l'achat et 1 EUR a la vente; depot SEPA suppose gratuit. |
+| `bourse_direct_500` | 0,99 EUR par ordre pour un ordre Euronext <= 500 EUR. |
+| `bourse_direct_1000` | 1,90 EUR par ordre pour un ordre Euronext > 500 et <= 1 000 EUR. |
+| `bourse_direct_2000` | 2,90 EUR par ordre pour un ordre Euronext > 1 000 et <= 2 000 EUR. |
+| `bourse_direct_pct` | 0,09% par ordre pour les ordres > 4 400 EUR. |
+| `bourse_direct_morgan_stanley` | 0 EUR par ordre sur la gamme Morgan Stanley warrants/certificats/turbos. |
+| `degiro_fr_actions` | 1 EUR de courtage + 1 EUR de frais de gestion par transaction Euronext Paris. |
+| `degiro_otc_sg_bnp` | 0,50 EUR par transaction sur produits de bourse OTC Societe Generale / BNP Paribas. |
+| `fortuneo_starter` | 0,35% par ordre. |
+| `fortuneo_starter_first_500` | 0 EUR par ordre, utile pour simuler le premier ordre mensuel <= 500 EUR. |
+
+Formules:
+
+```text
+buy_fee = FEE_BUY_FIXED + notional * FEE_BUY_PCT / 100
+deposit_fee = FEE_DEPOSIT_FIXED + notional * FEE_DEPOSIT_PCT / 100
+sell_fee(exit) = FEE_SELL_FIXED + exit_notional * FEE_SELL_PCT / 100
+
+cost_basis = notional + buy_fee + deposit_fee
+exit_notional = notional * exit_price / entry_price
+
+net_stop_loss_pct = (cost_basis - (stop_notional - sell_stop_fee)) / cost_basis * 100
+net_target_gain_pct = ((target_notional - sell_target_fee) - cost_basis) / cost_basis * 100
+roundtrip_fee_pct = (buy_fee + deposit_fee + sell_fee) / notional * 100
+```
+
+Dans Ratatui:
+
+- colonne `Fee`: cout aller-retour estime jusqu'a T2 en pourcentage du montant d'ordre;
+- ligne `Fees`: profil, montant simule, frais achat/depot/vente et transformation brut -> net;
+- ligne `Calc fees`: formule numerique appliquee au stop et a T2.
+
+Attention: ces frais broker ne remplacent pas le spread deja mesure dans le carnet, ni les frais implicites de financement/produit inclus par l'emetteur dans le prix du warrant/turbo. Ils servent a comparer le cout de passage d'ordre entre plateformes et a eviter qu'un edge de 1-2% soit transforme en faux signal par des frais fixes trop lourds sur un petit ordre.

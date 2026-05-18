@@ -17,13 +17,14 @@ use ratatui::{
     widgets::{Block, Borders, Cell, Paragraph, Row, Table, TableState, Wrap},
 };
 
+use crate::decision::models::{DecisionAction, DecisionSignal};
 use crate::indicators::warrant::{OpportunitySignal, ValuationSide};
 use crate::models::warrant::WarrantSnapshot;
 
 pub fn run(
     underlying: &WarrantSnapshot,
     product_count: usize,
-    signals: &[OpportunitySignal],
+    signals: &[DecisionSignal],
     initial_side_filter: &str,
 ) -> Result<()> {
     enable_raw_mode()?;
@@ -37,10 +38,11 @@ pub fn run(
     }
     let mut side_filter = SideFilter::from_str(initial_side_filter);
     let mut valuation_filter = ValuationFilter::Undervalued;
+    let mut decision_filter = DecisionFilter::All;
     let mut status_message = String::from("Entree/Espace: ouvrir Boursorama pour la ligne selectionnee");
 
     let result = loop {
-        let visible_signals = filter_signals(signals, side_filter, valuation_filter);
+        let visible_signals = filter_signals(signals, side_filter, valuation_filter, decision_filter);
         clamp_selection(&mut state, visible_signals.len());
 
         terminal.draw(|frame| {
@@ -53,6 +55,7 @@ pub fn run(
                 &mut state,
                 side_filter,
                 valuation_filter,
+                decision_filter,
                 &status_message,
             )
         })?;
@@ -70,23 +73,39 @@ pub fn run(
                     }
                     KeyCode::Char('a') => {
                         side_filter = SideFilter::All;
-                        select_first(&mut state, filter_signals(signals, side_filter, valuation_filter).len());
+                        select_first(&mut state, filter_signals(signals, side_filter, valuation_filter, decision_filter).len());
                     }
                     KeyCode::Char('c') => {
                         side_filter = SideFilter::Call;
-                        select_first(&mut state, filter_signals(signals, side_filter, valuation_filter).len());
+                        select_first(&mut state, filter_signals(signals, side_filter, valuation_filter, decision_filter).len());
                     }
                     KeyCode::Char('p') => {
                         side_filter = SideFilter::Put;
-                        select_first(&mut state, filter_signals(signals, side_filter, valuation_filter).len());
+                        select_first(&mut state, filter_signals(signals, side_filter, valuation_filter, decision_filter).len());
                     }
                     KeyCode::Char('u') => {
                         valuation_filter = ValuationFilter::Undervalued;
-                        select_first(&mut state, filter_signals(signals, side_filter, valuation_filter).len());
+                        select_first(&mut state, filter_signals(signals, side_filter, valuation_filter, decision_filter).len());
                     }
                     KeyCode::Char('o') => {
                         valuation_filter = ValuationFilter::Overvalued;
-                        select_first(&mut state, filter_signals(signals, side_filter, valuation_filter).len());
+                        select_first(&mut state, filter_signals(signals, side_filter, valuation_filter, decision_filter).len());
+                    }
+                    KeyCode::Char('b') => {
+                        decision_filter = DecisionFilter::Buy;
+                        select_first(&mut state, filter_signals(signals, side_filter, valuation_filter, decision_filter).len());
+                    }
+                    KeyCode::Char('w') => {
+                        decision_filter = DecisionFilter::Watch;
+                        select_first(&mut state, filter_signals(signals, side_filter, valuation_filter, decision_filter).len());
+                    }
+                    KeyCode::Char('x') => {
+                        decision_filter = DecisionFilter::Avoid;
+                        select_first(&mut state, filter_signals(signals, side_filter, valuation_filter, decision_filter).len());
+                    }
+                    KeyCode::Char('d') => {
+                        decision_filter = DecisionFilter::All;
+                        select_first(&mut state, filter_signals(signals, side_filter, valuation_filter, decision_filter).len());
                     }
                     _ => {}
                 }
@@ -106,10 +125,11 @@ fn draw(
     underlying: &WarrantSnapshot,
     product_count: usize,
     total_signal_count: usize,
-    visible_signals: &[&OpportunitySignal],
+    visible_signals: &[&DecisionSignal],
     state: &mut TableState,
     side_filter: SideFilter,
     valuation_filter: ValuationFilter,
+    decision_filter: DecisionFilter,
     status_message: &str,
 ) {
     let chunks = Layout::default()
@@ -117,7 +137,7 @@ fn draw(
         .constraints([
             Constraint::Length(6),
             Constraint::Min(8),
-            Constraint::Length(14),
+            Constraint::Length(20),
         ])
         .split(frame.area());
 
@@ -130,6 +150,7 @@ fn draw(
         visible_signals.len(),
         side_filter,
         valuation_filter,
+        decision_filter,
     );
     draw_table(frame, chunks[1], visible_signals, state);
     draw_details(
@@ -139,6 +160,7 @@ fn draw(
         state.selected(),
         side_filter,
         valuation_filter,
+        decision_filter,
         status_message,
     );
 }
@@ -152,6 +174,7 @@ fn draw_header(
     visible_signal_count: usize,
     side_filter: SideFilter,
     valuation_filter: ValuationFilter,
+    decision_filter: DecisionFilter,
 ) {
     let lines = vec![
         Line::from(vec![
@@ -190,18 +213,23 @@ fn draw_header(
             ),
             Span::raw("    "),
             Span::styled("Tri ", Style::default().fg(Color::DarkGray)),
-            Span::styled("edge net", Style::default().fg(Color::White)),
+            Span::styled("decision/confidence", Style::default().fg(Color::White)),
+            Span::raw("    "),
+            Span::styled("Decision ", Style::default().fg(Color::DarkGray)),
+            Span::styled(decision_filter.label(), Style::default().fg(Color::Cyan)),
             Span::raw("    "),
             Span::styled("Seuil ", Style::default().fg(Color::DarkGray)),
-            Span::styled("OPPORTUNITY_MIN_GAP_PCT", Style::default().fg(Color::White)),
+            Span::styled("DECISION_*", Style::default().fg(Color::White)),
         ]),
         Line::from(vec![
             Span::styled("Decision ", Style::default().fg(Color::DarkGray)),
-            Span::raw("Edge = gap relatif - cout du spread; "),
+            Span::raw("BUY/WATCH/AVOID via edge, R/R, data, spread; "),
             Span::styled("Execution ", Style::default().fg(Color::DarkGray)),
             Span::raw("DQ/Liq + bid/ask; "),
             Span::styled("Risque ", Style::default().fg(Color::DarkGray)),
             Span::raw("levier + distance barriere; "),
+            Span::styled("Fees ", Style::default().fg(Color::DarkGray)),
+            Span::raw("broker + depot + achat/vente; "),
             Span::styled("Options ", Style::default().fg(Color::DarkGray)),
             Span::raw("IV/smile si disponibles"),
         ]),
@@ -216,6 +244,14 @@ fn draw_header(
             Span::raw(" sous-evalues  "),
             Span::styled("[o]", Style::default().fg(Color::Yellow)),
             Span::raw(" sur-evalues  "),
+            Span::styled("[b]", Style::default().fg(Color::Yellow)),
+            Span::raw(" buy  "),
+            Span::styled("[w]", Style::default().fg(Color::Yellow)),
+            Span::raw(" watch  "),
+            Span::styled("[x]", Style::default().fg(Color::Yellow)),
+            Span::raw(" avoid  "),
+            Span::styled("[d]", Style::default().fg(Color::Yellow)),
+            Span::raw(" decisions all  "),
             Span::styled("[Enter]", Style::default().fg(Color::Yellow)),
             Span::raw(" Boursorama  "),
             Span::styled("[q]", Style::default().fg(Color::Yellow)),
@@ -251,12 +287,20 @@ fn colored_change(change_pct: f64) -> Span<'static> {
 fn draw_table(
     frame: &mut Frame,
     area: Rect,
-    signals: &[&OpportunitySignal],
+    signals: &[&DecisionSignal],
     state: &mut TableState,
 ) {
     let header = Row::new([
+        "Dec",
+        "Conf",
         "Edge",
-        "Gap",
+        "R/R",
+        "Size",
+        "Stop",
+        "T1",
+        "T2",
+        "BE",
+        "Fee",
         "Spr",
         "DQ",
         "Liq",
@@ -265,7 +309,6 @@ fn draw_table(
         "Mny",
         "Mat.",
         "Price",
-        "Ref.",
         "Bar%",
         "Lev",
         "IV",
@@ -279,12 +322,50 @@ fn draw_table(
     )
     .bottom_margin(1);
 
-    let rows = signals.iter().map(|signal| {
+    let rows = signals.iter().map(|decision| {
+        let signal = &decision.opportunity;
+        let plan = decision.trade_plan.as_ref();
         Row::new(vec![
+            Cell::from(decision_action_label(decision.decision))
+                .style(decision_action_style(decision.decision)),
+            Cell::from(
+                plan.map(|plan| format!("{:.0}", plan.confidence_score))
+                    .unwrap_or_else(|| "-".to_string()),
+            )
+            .style(score_style(plan.map(|plan| plan.confidence_score).unwrap_or(0.0))),
             Cell::from(format!("{:+.1}%", signal.spread_adjusted_gap_pct))
                 .style(edge_style(signal)),
-            Cell::from(format!("{:+.1}%", signal.peer_gap_pct))
-                .style(valuation_style(signal.valuation)),
+            Cell::from(
+                plan.and_then(|plan| plan.reward_risk_2)
+                    .map(|value| format!("{value:.2}"))
+                    .unwrap_or_else(|| "-".to_string()),
+            ),
+            Cell::from(
+                plan.map(|plan| format!("{:.1}%", plan.position.suggested_notional_pct))
+                    .unwrap_or_else(|| "-".to_string()),
+            ),
+            Cell::from(
+                plan.map(|plan| format!("-{:.1}%", plan.stop.loss_pct))
+                    .unwrap_or_else(|| "-".to_string()),
+            )
+            .style(stop_style(plan.map(|plan| plan.stop.loss_pct))),
+            Cell::from(
+                plan.map(|plan| format!("{:+.1}%", plan.target_1.gain_pct))
+                    .unwrap_or_else(|| "-".to_string()),
+            ),
+            Cell::from(
+                plan.map(|plan| format!("{:+.1}%", plan.target_2.gain_pct))
+                    .unwrap_or_else(|| "-".to_string()),
+            ),
+            Cell::from(
+                plan.and_then(|plan| plan.breakeven_move_pct)
+                    .map(|value| format!("{value:.2}%"))
+                    .unwrap_or_else(|| "-".to_string()),
+            ),
+            Cell::from(
+                plan.map(|plan| format!("{:.2}%", plan.fees.roundtrip_target_2_fee_pct))
+                    .unwrap_or_else(|| "-".to_string()),
+            ),
             Cell::from(
                 signal
                     .spread_pct
@@ -304,7 +385,6 @@ fn draw_table(
                 "{} {:.4}",
                 signal.price_currency, signal.last_price
             )),
-            Cell::from(format!("{:.2}", signal.strike)),
             Cell::from(
                 signal
                     .barrier_distance_pct
@@ -330,8 +410,16 @@ fn draw_table(
     });
 
     let widths = [
+        Constraint::Length(7),
+        Constraint::Length(6),
+        Constraint::Length(7),
+        Constraint::Length(8),
+        Constraint::Length(6),
         Constraint::Length(8),
         Constraint::Length(8),
+        Constraint::Length(8),
+        Constraint::Length(7),
+        Constraint::Length(7),
         Constraint::Length(7),
         Constraint::Length(5),
         Constraint::Length(5),
@@ -340,7 +428,6 @@ fn draw_table(
         Constraint::Length(6),
         Constraint::Length(10),
         Constraint::Length(12),
-        Constraint::Length(9),
         Constraint::Length(7),
         Constraint::Length(7),
         Constraint::Length(8),
@@ -365,24 +452,39 @@ fn draw_table(
 fn draw_details(
     frame: &mut Frame,
     area: Rect,
-    signals: &[&OpportunitySignal],
+    signals: &[&DecisionSignal],
     selected: Option<usize>,
     side_filter: SideFilter,
     valuation_filter: ValuationFilter,
+    decision_filter: DecisionFilter,
     status_message: &str,
 ) {
     let text = selected
         .and_then(|index| signals.get(index))
-        .map(|signal| {
+        .map(|decision| {
+            let signal = &decision.opportunity;
+            let plan = decision.trade_plan.as_ref();
             let mut lines = vec![
                 Line::from(vec![
+                    Span::styled("Decision ", Style::default().fg(Color::DarkGray)),
+                    Span::styled(
+                        decision_action_label(decision.decision),
+                        decision_action_style(decision.decision),
+                    ),
+                    Span::raw("  "),
+                    Span::styled("Conf ", Style::default().fg(Color::DarkGray)),
+                    Span::styled(
+                        plan.map(|plan| format!("{:.0}", plan.confidence_score)).unwrap_or_else(|| "-".to_string()),
+                        Style::default().fg(Color::White),
+                    ),
+                    Span::raw("  "),
                     Span::styled("Selected ", Style::default().fg(Color::DarkGray)),
                     Span::styled(
                         signal.symbol.clone(),
                         Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
                     ),
                     Span::raw("  "),
-                    Span::styled("edge net ", Style::default().fg(Color::DarkGray)),
+                    Span::styled("edge ", Style::default().fg(Color::DarkGray)),
                     Span::styled(
                         format!("{:+.2}%", signal.spread_adjusted_gap_pct),
                         valuation_style(signal.valuation),
@@ -439,11 +541,35 @@ fn draw_details(
                     ),
                 ]),
                 Line::from(vec![
-                    Span::styled("Decision ", Style::default().fg(Color::Yellow)),
-                    Span::styled(signal_decision(signal), decision_style(signal)),
+                    Span::styled("Pourquoi ", Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)),
+                    Span::raw(human_join_or_dash(&decision.reasons)),
                     Span::raw("  "),
-                    Span::styled("Score ", Style::default().fg(Color::DarkGray)),
-                    Span::styled(format!("{:.2}", signal.score), Style::default().fg(Color::White)),
+                    Span::styled("Warnings ", Style::default().fg(Color::Yellow)),
+                    Span::raw(human_join_or_dash(&decision.warnings)),
+                ]),
+                Line::from(vec![
+                    Span::styled("Entry ", Style::default().fg(Color::Yellow)),
+                    Span::raw(plan.map(|plan| format!("{:.4} {} via {}", plan.entry_price, signal.price_currency, plan.entry_price_source)).unwrap_or_else(|| "-".to_string())),
+                    Span::raw("  "),
+                    Span::styled("Stop ", Style::default().fg(Color::Yellow)),
+                    Span::raw(plan.map(|plan| format!("{:.4} -> {:.4} {} (-{:.2}%)", plan.stop.underlying_stop_price, plan.stop.estimated_product_stop_price, signal.price_currency, plan.stop.loss_pct)).unwrap_or_else(|| "-".to_string())),
+                    Span::raw("  "),
+                    Span::styled("T1/T2 ", Style::default().fg(Color::Yellow)),
+                    Span::raw(plan.map(|plan| format!("{:.4}/{:.4} {} ({:+.1}%/{:+.1}%)", plan.target_1.estimated_product_target_price, plan.target_2.estimated_product_target_price, signal.price_currency, plan.target_1.gain_pct, plan.target_2.gain_pct)).unwrap_or_else(|| "-".to_string())),
+                ]),
+                Line::from(vec![
+                    Span::styled("Reasons ", Style::default().fg(Color::Yellow)),
+                    Span::raw(join_or_dash(&decision.reasons)),
+                    Span::raw("  "),
+                    Span::styled("Warnings ", Style::default().fg(Color::Yellow)),
+                    Span::raw(join_or_dash(&decision.warnings)),
+                ]),
+                Line::from(vec![
+                    Span::styled("R/R ", Style::default().fg(Color::Yellow)),
+                    Span::raw(plan.and_then(|plan| plan.reward_risk_2).map(|value| format!("{value:.2}")).unwrap_or_else(|| "-".to_string())),
+                    Span::raw("  "),
+                    Span::styled("Size ", Style::default().fg(Color::Yellow)),
+                    Span::raw(plan.map(|plan| format!("{:.2}% capital, risque compte {:.2}%", plan.position.suggested_notional_pct, plan.position.estimated_account_loss_pct)).unwrap_or_else(|| "-".to_string())),
                     Span::raw("  "),
                     Span::styled("Pairs ", Style::default().fg(Color::DarkGray)),
                     Span::styled(signal.peer_count.to_string(), Style::default().fg(Color::White)),
@@ -453,6 +579,10 @@ fn draw_details(
                     Span::raw("  "),
                     Span::styled("Type ", Style::default().fg(Color::DarkGray)),
                     Span::styled(signal.product_type.clone(), Style::default().fg(Color::White)),
+                ]),
+                Line::from(vec![
+                    Span::styled("Fees ", Style::default().fg(Color::Yellow)),
+                    Span::raw(plan.map(fee_summary).unwrap_or_else(|| "-".to_string())),
                 ]),
                 Line::from(vec![
                     Span::styled("URL ", Style::default().fg(Color::Yellow)),
@@ -485,6 +615,17 @@ fn draw_details(
                     signal.spread_adjusted_gap_pct
                 )),
                 Line::from(format!(
+                    "Calc fees: {}",
+                    plan.map(fee_formula).unwrap_or_else(|| "-".to_string())
+                )),
+                Line::from(format!(
+                    "Calc trade: {}",
+                    plan.map(trade_formula).unwrap_or_else(|| format!(
+                        "pas de plan: {}",
+                        human_join_or_dash(&decision.reasons)
+                    ))
+                )),
+                Line::from(format!(
                     "Execution: {}  bid {}  ask {}  mid {}  spread {}  dataQ {:.0}/100  liq {:.0}/100  bidSize {}  askSize {}  vol {}",
                     signal.execution_status,
                     format_optional(signal.bid_price),
@@ -501,7 +642,7 @@ fn draw_details(
                     format_optional(signal.quote_volume)
                 )),
                 Line::from(format!(
-                    "Risk/Options: gearing {}  barrierDist {}  IV {}  smile {}  gapIV {}  signal {}  T {}  r {}  q {}",
+                    "Risk/Options: gearing {}  barrierDist {}  IV {}  smile {}  gapIV {}  signal {}  T {}  theta/d {}  thetaH {}  r {}  q {}",
                     format_optional(signal.effective_gearing),
                     signal
                         .barrier_distance_pct
@@ -515,6 +656,12 @@ fn draw_details(
                         .unwrap_or_else(|| "-".to_string()),
                     signal.volatility_signal,
                     format_optional(signal.years_to_maturity),
+                    plan.and_then(|plan| plan.horizon.theta_daily_pct)
+                        .map(|value| format!("{value:.2}%"))
+                        .unwrap_or_else(|| "-".to_string()),
+                    plan.and_then(|plan| plan.horizon.theta_to_horizon_pct)
+                        .map(|value| format!("{value:.2}%"))
+                        .unwrap_or_else(|| "-".to_string()),
                     format_optional_pct(signal.risk_free_rate),
                     format_optional_pct(signal.dividend_yield)
                 )),
@@ -536,6 +683,12 @@ fn draw_details(
                     side_filter.label(),
                     valuation_filter.label(),
                     signal.note
+                )),
+                Line::from(format!(
+                    "Decision filter: {}  Reasons: {}  Warnings: {}",
+                    decision_filter.label(),
+                    join_or_dash(&decision.reasons),
+                    join_or_dash(&decision.warnings)
                 )),
                 Line::from(vec![
                     Span::styled("Raccourcis ", Style::default().fg(Color::Yellow)),
@@ -620,14 +773,47 @@ impl ValuationFilter {
     }
 }
 
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum DecisionFilter {
+    All,
+    Buy,
+    Watch,
+    Avoid,
+}
+
+impl DecisionFilter {
+    fn label(self) -> &'static str {
+        match self {
+            Self::All => "all",
+            Self::Buy => "buy",
+            Self::Watch => "watch",
+            Self::Avoid => "avoid",
+        }
+    }
+
+    fn accepts(self, signal: &DecisionSignal) -> bool {
+        match self {
+            Self::All => true,
+            Self::Buy => signal.decision == DecisionAction::BuyCandidate,
+            Self::Watch => signal.decision == DecisionAction::Watch,
+            Self::Avoid => signal.decision == DecisionAction::Avoid,
+        }
+    }
+}
+
 fn filter_signals(
-    signals: &[OpportunitySignal],
+    signals: &[DecisionSignal],
     side_filter: SideFilter,
     valuation_filter: ValuationFilter,
-) -> Vec<&OpportunitySignal> {
+    decision_filter: DecisionFilter,
+) -> Vec<&DecisionSignal> {
     signals
         .iter()
-        .filter(|signal| side_filter.accepts(signal) && valuation_filter.accepts(signal))
+        .filter(|decision| {
+            side_filter.accepts(&decision.opportunity)
+                && valuation_filter.accepts(&decision.opportunity)
+                && decision_filter.accepts(decision)
+        })
         .collect()
 }
 
@@ -703,31 +889,36 @@ fn barrier_style(barrier_distance_pct: Option<f64>) -> Style {
     }
 }
 
-fn signal_decision(signal: &OpportunitySignal) -> &'static str {
-    let edge_ok = match signal.valuation {
-        ValuationSide::Undervalued => signal.spread_adjusted_gap_pct > 0.0,
-        ValuationSide::Overvalued => signal.spread_adjusted_gap_pct < 0.0,
-    };
-    if !edge_ok {
-        return "spread_eats_edge";
+fn stop_style(loss_pct: Option<f64>) -> Style {
+    match loss_pct {
+        Some(value) if value <= 15.0 => Style::default().fg(Color::Green),
+        Some(value) if value <= 25.0 => Style::default().fg(Color::Yellow),
+        Some(_) => Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+        None => Style::default().fg(Color::DarkGray),
     }
-    if signal.execution_status != "executable_bid_ask" {
-        return "not_executable";
-    }
-    if signal.data_quality_score < 60.0 {
-        return "weak_data";
-    }
-    if signal.spread_pct.unwrap_or(100.0) > 5.0 {
-        return "wide_spread";
-    }
-    "candidate"
 }
 
-fn decision_style(signal: &OpportunitySignal) -> Style {
-    match signal_decision(signal) {
-        "candidate" => Style::default().fg(Color::Green).add_modifier(Modifier::BOLD),
-        "wide_spread" | "weak_data" => Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
-        _ => Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+fn decision_action_label(decision: DecisionAction) -> &'static str {
+    match decision {
+        DecisionAction::BuyCandidate => "BUY",
+        DecisionAction::Watch => "WATCH",
+        DecisionAction::Avoid => "AVOID",
+        DecisionAction::ExitLoss => "EXIT",
+        DecisionAction::TakeProfit => "TAKE",
+        DecisionAction::Hold => "HOLD",
+    }
+}
+
+fn decision_action_style(decision: DecisionAction) -> Style {
+    match decision {
+        DecisionAction::BuyCandidate => Style::default().fg(Color::Green).add_modifier(Modifier::BOLD),
+        DecisionAction::Watch | DecisionAction::Hold => {
+            Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)
+        }
+        DecisionAction::Avoid | DecisionAction::ExitLoss => {
+            Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)
+        }
+        DecisionAction::TakeProfit => Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
     }
 }
 
@@ -762,10 +953,115 @@ fn calculation_summary(signal: &OpportunitySignal) -> String {
     )
 }
 
-fn selected_action_message(selected: Option<usize>, signals: &[&OpportunitySignal]) -> String {
+fn trade_formula(plan: &crate::decision::models::TradePlan) -> String {
+    format!(
+        "entry {:.4}; stop {:.4}->{:.4} (-{:.2}% net); T1 {:.4} ({:+.2}% net); T2 {:.4} ({:+.2}% net); R/R2 {}; size {:.2}% capital pour risque {:.2}%",
+        plan.entry_price,
+        plan.stop.underlying_stop_price,
+        plan.stop.estimated_product_stop_price,
+        plan.stop.loss_pct,
+        plan.target_1.estimated_product_target_price,
+        plan.target_1.gain_pct,
+        plan.target_2.estimated_product_target_price,
+        plan.target_2.gain_pct,
+        plan.reward_risk_2
+            .map(|value| format!("{value:.2}"))
+            .unwrap_or_else(|| "-".to_string()),
+        plan.position.suggested_notional_pct,
+        plan.position.estimated_account_loss_pct
+    )
+}
+
+fn fee_summary(plan: &crate::decision::models::TradePlan) -> String {
+    format!(
+        "profile {}  notional {:.2}  buy {:.2}  deposit {:.2}  sell@stop {:.2}  sell@T2 {:.2}  dragT2 {:.2}%  raw stop/T2 {:.2}%/{:+.2}% -> net {:.2}%/{:+.2}%",
+        plan.fees.profile,
+        plan.fees.order_notional,
+        plan.fees.buy_fee,
+        plan.fees.deposit_fee,
+        plan.fees.sell_stop_fee,
+        plan.fees.sell_target_2_fee,
+        plan.fees.roundtrip_target_2_fee_pct,
+        plan.fees.raw_stop_loss_pct,
+        plan.fees.raw_target_2_gain_pct,
+        plan.fees.net_stop_loss_pct,
+        plan.fees.net_target_2_gain_pct
+    )
+}
+
+fn fee_formula(plan: &crate::decision::models::TradePlan) -> String {
+    format!(
+        "cost_basis=notional+buy+deposit={:.2}+{:.2}+{:.2}; stop net=({:.2}-({:.2}-{:.2}))/{:.2}*100={:.2}%; T2 net=(({:.2}-{:.2})-{:.2})/{:.2}*100={:+.2}%",
+        plan.fees.order_notional,
+        plan.fees.buy_fee,
+        plan.fees.deposit_fee,
+        plan.fees.order_notional + plan.fees.buy_fee + plan.fees.deposit_fee,
+        plan.fees.order_notional * plan.stop.estimated_product_stop_price / plan.entry_price,
+        plan.fees.sell_stop_fee,
+        plan.fees.order_notional + plan.fees.buy_fee + plan.fees.deposit_fee,
+        plan.fees.net_stop_loss_pct,
+        plan.fees.order_notional * plan.target_2.estimated_product_target_price / plan.entry_price,
+        plan.fees.sell_target_2_fee,
+        plan.fees.order_notional + plan.fees.buy_fee + plan.fees.deposit_fee,
+        plan.fees.order_notional + plan.fees.buy_fee + plan.fees.deposit_fee,
+        plan.fees.net_target_2_gain_pct
+    )
+}
+
+fn join_or_dash(values: &[String]) -> String {
+    if values.is_empty() {
+        "-".to_string()
+    } else {
+        values.join("|")
+    }
+}
+
+fn human_join_or_dash(values: &[String]) -> String {
+    if values.is_empty() {
+        return "-".to_string();
+    }
+
+    values
+        .iter()
+        .map(|value| human_reason(value))
+        .collect::<Vec<_>>()
+        .join(" | ")
+}
+
+fn human_reason(value: &str) -> &'static str {
+    match value {
+        "entry_price_not_executable" => "pas de prix d'entree executable: bid/ask absent, nul ou incoherent",
+        "stop_not_computable" => "stop sous-jacent impossible a calculer",
+        "stop_projection_not_computable" => "prix produit au stop impossible a projeter",
+        "stop_projection_does_not_reduce_product_price" => {
+            "stop incoherent: la projection au stop ne baisse pas le prix du produit"
+        }
+        "targets_not_computable" => "objectifs de gain impossibles a calculer",
+        "position_sizing_not_computable" => "taille de position impossible a calculer",
+        "fees_not_computable" => "frais impossibles a calculer: profil, montant ou prix de sortie incoherent",
+        "bid_ask_not_executable" => "bid/ask non executable",
+        "data_quality_too_low" => "qualite de donnee trop faible",
+        "liquidity_too_low" => "liquidite trop faible",
+        "spread_too_wide" => "spread trop large",
+        "not_enough_peers" => "pas assez de pairs comparables",
+        "barrier_too_close" => "barriere trop proche",
+        "stop_loss_too_large" => "perte au stop trop grande",
+        "maturity_too_short" => "maturite trop courte",
+        "theta_cost_too_high" => "cout theta trop eleve sur l'horizon",
+        "reward_risk_missing" => "reward/risk manquant",
+        "reward_risk_below_threshold" => "reward/risk sous le seuil",
+        "theta_cost_high" => "cout theta eleve",
+        "entry_conditions_met" => "conditions d'entree remplies",
+        "watch_conditions_only" => "signal a surveiller: toutes les conditions d'achat ne sont pas remplies",
+        _ => "raison non documentee",
+    }
+}
+
+fn selected_action_message(selected: Option<usize>, signals: &[&DecisionSignal]) -> String {
     selected
         .and_then(|index| signals.get(index))
-        .map(|signal| {
+        .map(|decision| {
+            let signal = &decision.opportunity;
             let open_status = match open_url(&signal.web_url) {
                 Ok(()) => "ouverture demandee".to_string(),
                 Err(err) => format!("ouverture impossible depuis cet environnement ({err})"),
