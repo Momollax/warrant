@@ -4,7 +4,9 @@ Outil Rust/Docker pour recuperer et analyser des produits structures lies a un s
 
 La documentation principale est ici:
 
+- [Documentation de l'application](docs/application-documentation.md)
 - [Documentation technique et logique](docs/technical-and-logic.md)
+- [Plan d'implementation trading](docs/trade-plan-implementation-plan.md)
 
 Commandes utiles:
 

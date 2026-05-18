@@ -5,6 +5,7 @@ pub mod models;
 pub mod position;
 pub mod pricing_projection;
 pub mod risk;
+pub mod scenario;
 pub mod scoring;
 pub mod targets;
 pub mod time;

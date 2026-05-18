@@ -490,6 +490,89 @@ cmd_opportunities_csv() {
         "${IMAGE}"
 }
 
+cmd_scenario() {
+    local underlying="${1:-${SCENARIO_UNDERLYING:-hermes}}"
+    local underlying_ticker="${2:-${UNDERLYING_TICKER:-RMS.PA}}"
+    local target_price="${3:-${SCENARIO_TARGET_PRICE:-1800}}"
+    local target_date="${4:-${SCENARIO_TARGET_DATE:-2026-10-31}}"
+    local min_maturity="${5:-${SCENARIO_MIN_MATURITY:-2027-01-01}}"
+    local max_maturity="${6:-${SCENARIO_MAX_MATURITY:-2027-03-31}}"
+    local side="${7:-${SCENARIO_SIDE:-auto}}"
+    local limit="${8:-${SCENARIO_LIMIT:-500}}"
+    if [[ "${side}" =~ ^[0-9]+$ ]]; then
+        limit="${side}"
+        side="${SCENARIO_SIDE:-auto}"
+    fi
+    local boursorama_enrich="${BOURSORAMA_ENRICH:-0}"
+    local validate_boursorama="${OPPORTUNITY_VALIDATE_BOURSORAMA:-1}"
+    local validate_limit="${OPPORTUNITY_VALIDATE_LIMIT:-500}"
+    local require_validated_price="${OPPORTUNITY_REQUIRE_VALIDATED_PRICE:-1}"
+    local option_risk_free_rate="${OPTION_RISK_FREE_RATE:-0.045}"
+    local option_dividend_yield="${OPTION_DIVIDEND_YIELD:-0.005}"
+    local option_iv_signal_threshold="${OPTION_IV_SIGNAL_THRESHOLD:-0.03}"
+    local broker_fee_profile="${BROKER_FEE_PROFILE:-custom}"
+    local fee_order_notional="${FEE_ORDER_NOTIONAL:-1000}"
+    local cache_dir="${MARKET_DATA_CACHE_DIR:-data/cache/candles}"
+    local candles_range="${CANDLES_RANGE:-60d}"
+    local candles_interval="${CANDLES_INTERVAL:-60m}"
+    local market_data_refresh="${MARKET_DATA_REFRESH:-cache}"
+    local scenario_format="${SCENARIO_FORMAT:-table}"
+    local tty_args=()
+    if [[ -t 0 && -t 1 ]]; then
+        tty_args=(-it)
+        scenario_format="${SCENARIO_FORMAT:-tui}"
+    fi
+    ensure_data_dir
+    info "Scenario '${underlying}' spot '${underlying_ticker}' -> target ${target_price} au ${target_date}, maturite ${min_maturity}..${max_maturity}..."
+    docker run --rm "${tty_args[@]}" \
+        -v "${PWD}/data:/app/data" \
+        -e "TERM=${TERM:-xterm-256color}" \
+        -e "SCENARIO_FORMAT=${scenario_format}" \
+        -e "SCENARIO_UNDERLYING=${underlying}" \
+        -e "UNDERLYING_TICKER=${underlying_ticker}" \
+        -e "SCENARIO_TARGET_PRICE=${target_price}" \
+        -e "SCENARIO_TARGET_DATE=${target_date}" \
+        -e "SCENARIO_MIN_MATURITY=${min_maturity}" \
+        -e "SCENARIO_MAX_MATURITY=${max_maturity}" \
+        -e "SCENARIO_SIDE=${side}" \
+        -e "SCENARIO_LIMIT=${limit}" \
+        -e "BOURSORAMA_ENRICH=${boursorama_enrich}" \
+        -e "OPPORTUNITY_VALIDATE_BOURSORAMA=${validate_boursorama}" \
+        -e "OPPORTUNITY_VALIDATE_LIMIT=${validate_limit}" \
+        -e "OPPORTUNITY_REQUIRE_VALIDATED_PRICE=${require_validated_price}" \
+        -e "OPTION_RISK_FREE_RATE=${option_risk_free_rate}" \
+        -e "OPTION_DIVIDEND_YIELD=${option_dividend_yield}" \
+        -e "OPTION_IV_SIGNAL_THRESHOLD=${option_iv_signal_threshold}" \
+        -e "BROKER_FEE_PROFILE=${broker_fee_profile}" \
+        -e "FEE_ORDER_NOTIONAL=${fee_order_notional}" \
+        -e "MARKET_DATA_CACHE_DIR=${cache_dir}" \
+        -e "CANDLES_RANGE=${candles_range}" \
+        -e "CANDLES_INTERVAL=${candles_interval}" \
+        -e "MARKET_DATA_REFRESH=${market_data_refresh}" \
+        ${DECISION_MIN_DATA_QUALITY_SCORE:+-e "DECISION_MIN_DATA_QUALITY_SCORE=${DECISION_MIN_DATA_QUALITY_SCORE}"} \
+        ${DECISION_MIN_LIQUIDITY_SCORE:+-e "DECISION_MIN_LIQUIDITY_SCORE=${DECISION_MIN_LIQUIDITY_SCORE}"} \
+        ${DECISION_MAX_SPREAD_PCT:+-e "DECISION_MAX_SPREAD_PCT=${DECISION_MAX_SPREAD_PCT}"} \
+        ${FEE_BUY_FIXED:+-e "FEE_BUY_FIXED=${FEE_BUY_FIXED}"} \
+        ${FEE_BUY_PCT:+-e "FEE_BUY_PCT=${FEE_BUY_PCT}"} \
+        ${FEE_SELL_FIXED:+-e "FEE_SELL_FIXED=${FEE_SELL_FIXED}"} \
+        ${FEE_SELL_PCT:+-e "FEE_SELL_PCT=${FEE_SELL_PCT}"} \
+        ${FEE_DEPOSIT_FIXED:+-e "FEE_DEPOSIT_FIXED=${FEE_DEPOSIT_FIXED}"} \
+        ${FEE_DEPOSIT_PCT:+-e "FEE_DEPOSIT_PCT=${FEE_DEPOSIT_PCT}"} \
+        ${ORATS_API_KEY:+-e "ORATS_API_KEY=${ORATS_API_KEY}"} \
+        ${POLYGON_API_KEY:+-e "POLYGON_API_KEY=${POLYGON_API_KEY}"} \
+        ${GEMINI_API_KEY:+-e "GEMINI_API_KEY=${GEMINI_API_KEY}"} \
+        ${GEMINI_MODEL:+-e "GEMINI_MODEL=${GEMINI_MODEL}"} \
+        ${GEMINI_BASE_URL:+-e "GEMINI_BASE_URL=${GEMINI_BASE_URL}"} \
+        ${LLM_ENABLE:+-e "LLM_ENABLE=${LLM_ENABLE}"} \
+        ${LLM_API_KEY:+-e "LLM_API_KEY=${LLM_API_KEY}"} \
+        ${LLM_MODEL:+-e "LLM_MODEL=${LLM_MODEL}"} \
+        ${LLM_BASE_URL:+-e "LLM_BASE_URL=${LLM_BASE_URL}"} \
+        ${LLM_CACHE:+-e "LLM_CACHE=${LLM_CACHE}"} \
+        ${LLM_CACHE_DIR:+-e "LLM_CACHE_DIR=${LLM_CACHE_DIR}"} \
+        ${BROWSER:+-e "BROWSER=${BROWSER}"} \
+        "${IMAGE}"
+}
+
 cmd_rebuild() {
     info "Rebuild complet (stop → clean image → build → run)…"
     if is_running; then cmd_stop; fi
@@ -528,6 +611,8 @@ ${BOLD}Commandes :${NC}
                                UI claire des candidats décorrélés
   ${GREEN}opportunities-csv${NC} [underlying] [spot] [limit] [all|call|put]
                                Export CSV des candidats décorrélés
+  ${GREEN}scenario${NC} [underlying] [spot] [target] [target_date] [min_mat] [max_mat] [auto|force-call|force-put] [limit]
+                               Classe les warrants selon une these de cours cible
   ${GREEN}clean${NC}                        Supprime le container et l'image (confirmation)
   ${GREEN}rebuild${NC} [log] [tickers]      Stop + clean image + build + run
   ${GREEN}help${NC}                         Affiche cette aide
@@ -551,7 +636,11 @@ ${BOLD}.env :${NC}
       BROKER_FEE_PROFILE, FEE_ORDER_NOTIONAL, FEE_BUY_FIXED,
       FEE_BUY_PCT, FEE_SELL_FIXED, FEE_SELL_PCT,
       FEE_DEPOSIT_FIXED, FEE_DEPOSIT_PCT,
-      ORATS_API_KEY, POLYGON_API_KEY, BROWSER.
+      SCENARIO_TARGET_PRICE, SCENARIO_TARGET_DATE,
+      SCENARIO_MIN_MATURITY, SCENARIO_MAX_MATURITY, SCENARIO_SIDE,
+      SCENARIO_FORMAT,
+      ORATS_API_KEY, POLYGON_API_KEY, GEMINI_API_KEY, GEMINI_MODEL,
+      LLM_ENABLE, LLM_CACHE, BROWSER.
 
 ${BOLD}Exemples :${NC}
   $0 build
@@ -566,6 +655,7 @@ ${BOLD}Exemples :${NC}
   $0 analyze hermes RMS.PA 50
   $0 opportunities hermes RMS.PA 500 call
   $0 opportunities-csv hermes RMS.PA 500 put
+  $0 scenario hermes RMS.PA 1800 2026-10-31 2027-01-01 2027-03-31 500
   $0 logs 100
   $0 status
   $0 rebuild
@@ -591,6 +681,7 @@ case "${1:-help}" in
     analyze) cmd_analyze "${2:-}" "${3:-}" "${4:-}" ;;
     opportunities) cmd_opportunities "${2:-}" "${3:-}" "${4:-}" "${5:-}" ;;
     opportunities-csv) cmd_opportunities_csv "${2:-}" "${3:-}" "${4:-}" "${5:-}" ;;
+    scenario) cmd_scenario "${2:-}" "${3:-}" "${4:-}" "${5:-}" "${6:-}" "${7:-}" "${8:-}" "${9:-}" ;;
     rebuild) cmd_rebuild "${2:-}" ;;
     help|--help|-h) cmd_help ;;
     *)

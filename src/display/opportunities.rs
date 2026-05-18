@@ -225,7 +225,7 @@ fn draw_header(
             Span::styled("Decision ", Style::default().fg(Color::DarkGray)),
             Span::raw("BUY/WATCH/AVOID via edge, R/R, data, spread; "),
             Span::styled("Execution ", Style::default().fg(Color::DarkGray)),
-            Span::raw("DQ/Liq + bid/ask; "),
+            Span::raw("DQ + bid/ask; Flow informatif; "),
             Span::styled("Risque ", Style::default().fg(Color::DarkGray)),
             Span::raw("levier + distance barriere; "),
             Span::styled("Fees ", Style::default().fg(Color::DarkGray)),
@@ -303,7 +303,7 @@ fn draw_table(
         "Fee",
         "Spr",
         "DQ",
-        "Liq",
+        "Flow",
         "Symbol",
         "Side",
         "Mny",
@@ -626,7 +626,7 @@ fn draw_details(
                     ))
                 )),
                 Line::from(format!(
-                    "Execution: {}  bid {}  ask {}  mid {}  spread {}  dataQ {:.0}/100  liq {:.0}/100  bidSize {}  askSize {}  vol {}",
+                    "Execution: {}  bid {}  ask {}  mid {}  spread {}  dataQ {:.0}/100  flow {:.0}/100  bidSize {}  askSize {}  vol {}",
                     signal.execution_status,
                     format_optional(signal.bid_price),
                     format_optional(signal.ask_price),

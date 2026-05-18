@@ -144,6 +144,115 @@ pub fn rank_relative_value(
     signals
 }
 
+pub fn standalone_product_signals(
+    products: &[StructuredProduct],
+    spot_price: f64,
+    spot_currency: &str,
+    fx_rates: &FxRateBook,
+) -> Vec<OpportunitySignal> {
+    let mut grouped: BTreeMap<String, Vec<ComparableProduct<'_>>> = BTreeMap::new();
+
+    for product in products {
+        if let Some(comparable) =
+            ComparableProduct::from_product(product, spot_price, spot_currency, fx_rates)
+        {
+            grouped
+                .entry(comparable.bucket_key())
+                .or_default()
+                .push(comparable);
+        }
+    }
+
+    let mut signals = Vec::new();
+    for peers in grouped.values() {
+        let median = median(
+            peers
+                .iter()
+                .map(|peer| peer.relative_metric)
+                .collect::<Vec<_>>(),
+        );
+        let smile_median_iv =
+            median_implied_volatility(peers.iter().map(|peer| peer.implied_volatility));
+
+        for peer in peers {
+            let peer_gap_pct = if median > 0.0 {
+                (median - peer.relative_metric) / median * 100.0
+            } else {
+                0.0
+            };
+            signals.push(peer.to_signal(median, peer_gap_pct, peers.len(), smile_median_iv));
+        }
+    }
+
+    signals.sort_by(|left, right| {
+        left.product_family
+            .cmp(&right.product_family)
+            .then_with(|| left.side.cmp(&right.side))
+            .then_with(|| left.maturity.cmp(&right.maturity))
+            .then_with(|| {
+                left.strike
+                    .partial_cmp(&right.strike)
+                    .unwrap_or(Ordering::Equal)
+            })
+            .then_with(|| left.symbol.cmp(&right.symbol))
+    });
+    signals
+}
+
+pub fn scenario_warrant_signals(
+    products: &[StructuredProduct],
+    spot_price: f64,
+    spot_currency: &str,
+    fx_rates: &FxRateBook,
+) -> Vec<OpportunitySignal> {
+    let mut grouped: BTreeMap<String, Vec<ComparableProduct<'_>>> = BTreeMap::new();
+
+    for product in products {
+        if let Some(comparable) =
+            ComparableProduct::from_warrant_for_scenario(product, spot_price, spot_currency, fx_rates)
+        {
+            grouped
+                .entry(comparable.bucket_key())
+                .or_default()
+                .push(comparable);
+        }
+    }
+
+    let mut signals = Vec::new();
+    for peers in grouped.values() {
+        let median = median(
+            peers
+                .iter()
+                .map(|peer| peer.relative_metric)
+                .collect::<Vec<_>>(),
+        );
+        let smile_median_iv =
+            median_implied_volatility(peers.iter().map(|peer| peer.implied_volatility));
+
+        for peer in peers {
+            let peer_gap_pct = if median > 0.0 {
+                (median - peer.relative_metric) / median * 100.0
+            } else {
+                0.0
+            };
+            signals.push(peer.to_signal(median, peer_gap_pct, peers.len(), smile_median_iv));
+        }
+    }
+
+    signals.sort_by(|left, right| {
+        left.side
+            .cmp(&right.side)
+            .then_with(|| left.maturity.cmp(&right.maturity))
+            .then_with(|| {
+                left.strike
+                    .partial_cmp(&right.strike)
+                    .unwrap_or(Ordering::Equal)
+            })
+            .then_with(|| left.symbol.cmp(&right.symbol))
+    });
+    signals
+}
+
 #[derive(Clone)]
 struct ComparableProduct<'a> {
     product: &'a StructuredProduct,
@@ -191,6 +300,25 @@ impl<'a> ComparableProduct<'a> {
         spot_currency: &'a str,
         fx_rates: &FxRateBook,
     ) -> Option<Self> {
+        Self::from_product_inner(product, spot_price, spot_currency, fx_rates, true)
+    }
+
+    fn from_warrant_for_scenario(
+        product: &'a StructuredProduct,
+        spot_price: f64,
+        spot_currency: &'a str,
+        fx_rates: &FxRateBook,
+    ) -> Option<Self> {
+        Self::from_product_inner(product, spot_price, spot_currency, fx_rates, false)
+    }
+
+    fn from_product_inner(
+        product: &'a StructuredProduct,
+        spot_price: f64,
+        spot_currency: &'a str,
+        fx_rates: &FxRateBook,
+        require_positive_intrinsic: bool,
+    ) -> Option<Self> {
         if !is_exploitable(product) {
             return None;
         }
@@ -200,6 +328,9 @@ impl<'a> ComparableProduct<'a> {
         }
         let spec = pricing_spec(product)?;
         let pricing_model = spec.model;
+        if !require_positive_intrinsic && pricing_model != PricingModel::WarrantIntrinsic {
+            return None;
+        }
         let reference_currency = if spec.reference_currency.is_empty() {
             spot_currency.to_string()
         } else {
@@ -222,14 +353,15 @@ impl<'a> ComparableProduct<'a> {
         let strike = spec.payoff_reference;
         let last_price = quote_price.value;
         let raw_intrinsic = raw_intrinsic(product.direction, spot_in_reference_currency, strike);
-        if last_price <= 0.0 || raw_intrinsic <= 0.0 {
+        if last_price <= 0.0 || (require_positive_intrinsic && raw_intrinsic <= 0.0) {
             return None;
         }
 
         let warrants_per_underlying = warrants_per_underlying(product);
         let intrinsic_per_product_in_strike_currency = match warrants_per_underlying {
-            Some(parity) if parity > 0.0 => raw_intrinsic / parity,
-            _ => raw_intrinsic,
+            Some(parity) if parity > 0.0 && raw_intrinsic > 0.0 => raw_intrinsic / parity,
+            _ if raw_intrinsic > 0.0 => raw_intrinsic,
+            _ => 0.0,
         };
         let fx_rate = fx_rates.rate(&reference_currency, &price_currency)?;
         let fx_source_ticker = fx_rates
@@ -239,11 +371,15 @@ impl<'a> ComparableProduct<'a> {
         let intrinsic_per_product =
             intrinsic_per_product_in_strike_currency * fx_rate;
 
-        if intrinsic_per_product <= 0.0 {
+        if require_positive_intrinsic && intrinsic_per_product <= 0.0 {
             return None;
         }
 
-        let price_to_intrinsic = last_price / intrinsic_per_product;
+        let price_to_intrinsic = if intrinsic_per_product > 0.0 {
+            last_price / intrinsic_per_product
+        } else {
+            0.0
+        };
         let (metric_kind, relative_metric) = relative_metric_for_product(
             product.direction,
             pricing_model,
@@ -1285,6 +1421,61 @@ mod tests {
         assert!(!signals.iter().any(|signal| signal.symbol == "NODETAIL"));
         assert!(!signals.iter().any(|signal| signal.symbol == "HALTED"));
         assert!(signals.is_empty(), "only two usable peers remain, below MIN_PEERS");
+    }
+
+    #[test]
+    fn standalone_signals_do_not_require_relative_value_peers() {
+        let products = vec![product_with_boursorama_bid_ask(
+            "SOLO",
+            "Warrant Call",
+            Direction::Call,
+            280.0,
+            3.99,
+            Some(3.98),
+            Some(4.00),
+        )];
+
+        let relative_signals = rank_relative_value(&products, 300.23, "USD", &fx_book());
+        let standalone_signals =
+            standalone_product_signals(&products, 300.23, "USD", &fx_book());
+
+        assert!(relative_signals.is_empty());
+        assert_eq!(standalone_signals.len(), 1);
+        assert_eq!(standalone_signals[0].symbol, "SOLO");
+        assert_eq!(standalone_signals[0].peer_count, 1);
+        assert_eq!(standalone_signals[0].execution_status, "executable_bid_ask");
+        assert!(standalone_signals[0].implied_volatility.is_some());
+    }
+
+    #[test]
+    fn scenario_warrant_signals_keep_otm_vanilla_warrants() {
+        let mut otm_call = product_with_boursorama_bid_ask(
+            "OTM",
+            "Warrant Call",
+            Direction::Call,
+            330.0,
+            0.85,
+            Some(0.84),
+            Some(0.86),
+        );
+        otm_call.moneyness = Moneyness::OutOfTheMoney;
+
+        let products = vec![otm_call];
+
+        let standalone_signals =
+            standalone_product_signals(&products, 300.23, "USD", &fx_book());
+        let scenario_signals = scenario_warrant_signals(&products, 300.23, "USD", &fx_book());
+
+        assert!(
+            standalone_signals.is_empty(),
+            "relative-value standalone keeps only products with current intrinsic value"
+        );
+        assert_eq!(scenario_signals.len(), 1);
+        assert_eq!(scenario_signals[0].symbol, "OTM");
+        assert_eq!(scenario_signals[0].pricing_model, "warrant_intrinsic");
+        assert_eq!(scenario_signals[0].execution_status, "executable_bid_ask");
+        assert_eq!(scenario_signals[0].raw_intrinsic, 0.0);
+        assert!(scenario_signals[0].implied_volatility.is_some());
     }
 
     fn fx_book() -> FxRateBook {

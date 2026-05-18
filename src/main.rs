@@ -5,6 +5,7 @@ mod config;
 mod decision;
 mod display;
 mod indicators;
+mod llm;
 mod models;
 mod parser;
 mod pricing;
@@ -23,12 +24,19 @@ use api::discover::discover_by_underlying;
 use api::orats::OratsClient;
 use api::polygon::PolygonClient;
 use config::{resolve_max_cycles, resolve_tickers, REFRESH_INTERVAL_SECS};
+use chrono::{NaiveDate, Utc};
 use decision::config::DecisionConfig;
 use decision::market_indicators::compute_market_indicators;
 use decision::models::{DecisionAction, DecisionSignal, MarketContext};
+use decision::scenario::{
+    analyze_warrant_scenario, default_max_maturity_for_early_next_year, ScenarioCandidate,
+    ScenarioConfig,
+};
 use decision::trade_plan::build_trade_plan;
 use futures::{stream, StreamExt};
-use indicators::warrant::{rank_relative_value, OpportunitySignal, ValuationSide};
+use indicators::warrant::{
+    rank_relative_value, scenario_warrant_signals, OpportunitySignal, ValuationSide,
+};
 use models::euronext::EuronextProduct;
 use models::structured::StructuredProduct;
 
@@ -58,6 +66,62 @@ async fn main() -> Result<()> {
         let limit = args.get(4).and_then(|value| value.parse().ok());
         let side_filter = args.get(5).map(String::as_str).unwrap_or("all");
         return run_opportunities(underlying, underlying_ticker, limit, side_filter).await;
+    }
+    if args.get(1).is_some_and(|arg| arg == "scenario") {
+        let underlying = args.get(2).map(String::as_str).unwrap_or("hermes");
+        let underlying_ticker = args
+            .get(3)
+            .map(String::as_str)
+            .unwrap_or_else(|| default_underlying_ticker(underlying));
+        let target_price = args
+            .get(4)
+            .and_then(|value| value.parse().ok())
+            .or_else(|| read_env_f64("SCENARIO_TARGET_PRICE"))
+            .unwrap_or(1800.0);
+        let target_date = args
+            .get(5)
+            .map(String::as_str)
+            .and_then(parse_date_arg)
+            .or_else(|| read_env_date("SCENARIO_TARGET_DATE"))
+            .unwrap_or_else(|| NaiveDate::from_ymd_opt(2026, 10, 31).unwrap());
+        let min_maturity = args
+            .get(6)
+            .map(String::as_str)
+            .and_then(parse_date_arg);
+        let min_maturity = min_maturity.or_else(|| read_env_date("SCENARIO_MIN_MATURITY"));
+        let max_maturity = args
+            .get(7)
+            .map(String::as_str)
+            .and_then(parse_date_arg);
+        let max_maturity = max_maturity.or_else(|| read_env_date("SCENARIO_MAX_MATURITY"));
+        let side_arg = args.get(8).cloned();
+        let side_arg_is_limit = side_arg
+            .as_deref()
+            .is_some_and(|value| value.parse::<usize>().is_ok());
+        let side = if side_arg_is_limit {
+            std::env::var("SCENARIO_SIDE").unwrap_or_else(|_| "auto".to_string())
+        } else {
+            side_arg
+                .clone()
+                .or_else(|| std::env::var("SCENARIO_SIDE").ok())
+                .unwrap_or_else(|| "auto".to_string())
+        };
+        let limit = if side_arg_is_limit {
+            side_arg.as_deref().and_then(|value| value.parse().ok())
+        } else {
+            args.get(9).and_then(|value| value.parse().ok())
+        };
+        return run_scenario(
+            underlying,
+            underlying_ticker,
+            target_price,
+            target_date,
+            min_maturity,
+            max_maturity,
+            &side,
+            limit,
+        )
+        .await;
     }
     if args.get(1).is_some_and(|arg| arg == "orats-test") {
         let ticker = args.get(2).map(String::as_str).unwrap_or("RMS.PA");
@@ -97,6 +161,30 @@ async fn main() -> Result<()> {
             .and_then(|value| value.parse().ok());
         let side_filter = std::env::var("OPPORTUNITY_SIDE").unwrap_or_else(|_| "all".to_string());
         return run_opportunities(&underlying, &underlying_ticker, limit, &side_filter).await;
+    }
+    if let Ok(underlying) = std::env::var("SCENARIO_UNDERLYING") {
+        let underlying_ticker =
+            std::env::var("UNDERLYING_TICKER").unwrap_or_else(|_| default_underlying_ticker(&underlying).to_string());
+        let target_price = read_env_f64("SCENARIO_TARGET_PRICE").unwrap_or(1800.0);
+        let target_date = read_env_date("SCENARIO_TARGET_DATE")
+            .unwrap_or_else(|| NaiveDate::from_ymd_opt(2026, 10, 31).unwrap());
+        let min_maturity = read_env_date("SCENARIO_MIN_MATURITY");
+        let max_maturity = read_env_date("SCENARIO_MAX_MATURITY");
+        let side = std::env::var("SCENARIO_SIDE").unwrap_or_else(|_| "auto".to_string());
+        let limit = std::env::var("SCENARIO_LIMIT")
+            .ok()
+            .and_then(|value| value.parse().ok());
+        return run_scenario(
+            &underlying,
+            &underlying_ticker,
+            target_price,
+            target_date,
+            min_maturity,
+            max_maturity,
+            &side,
+            limit,
+        )
+        .await;
     }
     if let Ok(ticker) = std::env::var("ORATS_TEST_TICKER") {
         return run_orats_test(&ticker).await;
@@ -341,6 +429,118 @@ async fn run_opportunities(
         print_opportunity_table(&filtered_signals);
     }
 
+    Ok(())
+}
+
+async fn run_scenario(
+    underlying: &str,
+    underlying_ticker: &str,
+    target_price: f64,
+    target_date: NaiveDate,
+    min_maturity: Option<NaiveDate>,
+    max_maturity: Option<NaiveDate>,
+    side: &str,
+    limit: Option<usize>,
+) -> Result<()> {
+    let client = build_client()?;
+    let mut base = build_market_base(&client, underlying, underlying_ticker, limit).await?;
+    let mut signals = scenario_warrant_signals(
+        &base.products,
+        base.underlying_quote.price,
+        &base.underlying_quote.currency,
+        &base.fx_rates,
+    );
+    trace::log(format!(
+        "scenario: initial signals={} call={} put={} products={}",
+        signals.len(),
+        signals.iter().filter(|signal| signal.side == "call").count(),
+        signals.iter().filter(|signal| signal.side == "put").count(),
+        base.products.len()
+    ));
+
+    let validated_count =
+        validate_opportunity_candidates(&client, &mut base.products, &signals).await;
+    if validated_count > 0 {
+        signals = scenario_warrant_signals(
+            &base.products,
+            base.underlying_quote.price,
+            &base.underlying_quote.currency,
+            &base.fx_rates,
+        );
+        trace::log(format!(
+            "scenario: signals after validation={} call={} put={}",
+            signals.len(),
+            signals.iter().filter(|signal| signal.side == "call").count(),
+            signals.iter().filter(|signal| signal.side == "put").count()
+        ));
+        eprintln!(
+            "[INFO] {} candidat(s) valide(s) via Boursorama, scenario recalcule",
+            validated_count
+        );
+    }
+    if opportunity_require_validated_price() {
+        let unverified_count = signals
+            .iter()
+            .filter(|signal| signal.price_source == "last_unverified")
+            .count();
+        if unverified_count > 0 {
+            eprintln!(
+                "[INFO] {} produit(s) scenario gardes avec prix non executable: ils seront classes AVOID tant que le bid/ask n'est pas valide",
+                unverified_count
+            );
+        }
+    }
+
+    let decision_config = DecisionConfig::from_env();
+    let market_context = build_decision_market_context(&client, &base).await;
+    let scenario_side = scenario_side(side, target_price, base.underlying_quote.price);
+    let scenario_config = ScenarioConfig {
+        target_price,
+        target_date,
+        min_maturity,
+        max_maturity: max_maturity
+            .or_else(|| default_max_maturity_for_early_next_year(target_date)),
+        side: scenario_side.to_string(),
+        risk_free_rate: market_context.risk_free_rate,
+        dividend_yield: market_context.dividend_yield,
+        fallback_volatility: market_context.realized_volatility_20d.unwrap_or(0.35),
+    };
+    let today = Utc::now().date_naive();
+    let candidates = analyze_warrant_scenario(
+        &signals,
+        base.underlying_quote.price,
+        &scenario_config,
+        &decision_config,
+        today,
+    );
+    trace::log(format!(
+        "scenario: analyzed candidates={} side={} target={}",
+        candidates.len(),
+        scenario_config.side,
+        scenario_config.target_price
+    ));
+
+    let format = std::env::var("SCENARIO_FORMAT").unwrap_or_else(|_| {
+        if io::stdout().is_terminal() {
+            "tui".to_string()
+        } else {
+            "table".to_string()
+        }
+    });
+    if format == "tui" && io::stdout().is_terminal() {
+        return display::scenario::run(
+            &base.underlying_quote,
+            base.products.len(),
+            &signals,
+            &decision_config,
+            &scenario_config,
+            side,
+            today,
+        );
+    }
+
+    print_scenario_summary(&base.underlying_quote, &scenario_config, candidates.len());
+    print_scenario_table(&candidates, 20);
     Ok(())
 }
 
@@ -643,7 +843,7 @@ fn print_opportunity_summary(
         visible_signal_count, total_signal_count, product_count, normalize_side_filter(side_filter)
     );
     eprintln!(
-        "[WARN] Ces signaux ne sont pas des arbitrages garantis: FX, frais, bid/ask executables, liquidite et statut temps reel restent a verifier."
+        "[WARN] Ces signaux ne sont pas des arbitrages garantis: FX, frais, bid/ask executables, market maker et statut temps reel restent a verifier."
     );
 }
 
@@ -672,7 +872,7 @@ fn print_rank_section(
     println!("{title}");
     println!(
         "{:<6} {:>5} {:>7} {:>6} {:>7} {:>7} {:>7} {:>7} {:>6} {:>6} {:>6} {:>5} {:>5} {:<8} {:<5} {:<22} {:<10} {:>10}",
-        "dec", "conf", "edge", "rr2", "size%", "stop%", "t1%", "t2%", "be%", "fee%", "spr%", "dq", "liq", "symbol", "side", "type", "maturity", "price"
+        "dec", "conf", "edge", "rr2", "size%", "stop%", "t1%", "t2%", "be%", "fee%", "spr%", "dq", "flow", "symbol", "side", "type", "maturity", "price"
     );
     println!("{}", "-".repeat(150));
 
@@ -712,6 +912,100 @@ fn print_rank_section(
 
     if printed == 0 {
         println!("Aucun signal dans cette categorie avec le filtre actuel.");
+    }
+}
+
+fn print_scenario_summary(
+    underlying: &models::warrant::WarrantSnapshot,
+    config: &ScenarioConfig,
+    candidate_count: usize,
+) {
+    eprintln!(
+        "[INFO] Scenario {} {:.4} {} -> target {:.4} au {} | side {} | maturite {}..{} | candidats {}",
+        underlying.ticker,
+        underlying.price,
+        underlying.currency,
+        config.target_price,
+        config.target_date,
+        config.side,
+        config
+            .min_maturity
+            .map(|date| date.to_string())
+            .unwrap_or_else(|| "-".to_string()),
+        config
+            .max_maturity
+            .map(|date| date.to_string())
+            .unwrap_or_else(|| "-".to_string()),
+        candidate_count
+    );
+}
+
+fn print_scenario_table(candidates: &[ScenarioCandidate], limit: usize) {
+    println!(
+        "{:<6} {:>5} {:<10} {:<4} {:>8} {:<10} {:>8} {:>8} {:>8} {:>7} {:>7} {:>7} {:>7} {:>8} {:>6} {:>5} {:>5} {:<}",
+        "dec", "score", "symbol", "side", "strike", "maturity", "entry", "targetPx", "net%", "pBE%", "pTgt%", "EV%", "Kelly%", "Delta", "iv%", "dq", "flow", "url"
+    );
+    println!("{}", "-".repeat(190));
+    for candidate in candidates.iter().take(limit) {
+        println!(
+            "{:<6} {:>5.0} {:<10} {:<4} {:>8.2} {:<10} {:>8.4} {:>8.4} {:>+8.1} {:>7} {:>7} {:>7} {:>7} {:>8} {:>6} {:>5.0} {:>5.0} {}",
+            candidate.decision,
+            candidate.score,
+            truncate_display(&candidate.symbol, 10),
+            candidate.side,
+            candidate.strike,
+            candidate.maturity,
+            candidate.entry_price,
+            candidate.projected_price,
+            candidate.net_return_pct,
+            candidate.probability_breakeven_pct.map(|value| format!("{value:.1}")).unwrap_or_else(|| "-".to_string()),
+            candidate.probability_target_pct.map(|value| format!("{value:.1}")).unwrap_or_else(|| "-".to_string()),
+            candidate.expected_value_pct.map(|value| format!("{value:+.1}")).unwrap_or_else(|| "-".to_string()),
+            candidate.kelly_fraction_pct.map(|value| format!("{value:.1}")).unwrap_or_else(|| "-".to_string()),
+            candidate.delta.map(|value| format!("{value:.4}")).unwrap_or_else(|| "-".to_string()),
+            candidate
+                .implied_volatility
+                .map(|value| format!("{:.1}", value * 100.0))
+                .unwrap_or_else(|| "-".to_string()),
+            candidate.data_quality_score,
+            candidate.liquidity_score,
+            candidate.url
+        );
+        println!(
+            "       type={} parity={} vol_used={:.1}% spread={} BE={} BE_dist={} zTgt={} zBE={} Sharpe={} theta/d={} vega/pt={} rho/1%={} reasons={}",
+            truncate_display(&candidate.product_type, 34),
+            format_float(candidate.parity),
+            candidate.volatility_used * 100.0,
+            candidate
+                .spread_pct
+                .map(|value| format!("{value:.2}%"))
+                .unwrap_or_else(|| "-".to_string()),
+            candidate
+                .breakeven_underlying
+                .map(|value| format!("{value:.2}"))
+                .unwrap_or_else(|| "-".to_string()),
+            candidate
+                .breakeven_distance_pct
+                .map(|value| format!("{value:+.2}%"))
+                .unwrap_or_else(|| "-".to_string()),
+            candidate.target_zscore.map(|value| format!("{value:.3}")).unwrap_or_else(|| "-".to_string()),
+            candidate.breakeven_zscore.map(|value| format!("{value:.3}")).unwrap_or_else(|| "-".to_string()),
+            candidate.sharpe_like.map(|value| format!("{value:.3}")).unwrap_or_else(|| "-".to_string()),
+            candidate
+                .theta_horizon_pct
+                .map(|value| format!("{value:.3}%"))
+                .unwrap_or_else(|| "-".to_string()),
+            candidate.vega_per_vol_point.map(|value| format!("{value:.5}")).unwrap_or_else(|| "-".to_string()),
+            candidate.rho_per_rate_point.map(|value| format!("{value:.5}")).unwrap_or_else(|| "-".to_string()),
+            if candidate.reasons.is_empty() {
+                "-".to_string()
+            } else {
+                candidate.reasons.join("|")
+            }
+        );
+    }
+    if candidates.is_empty() {
+        println!("Aucun warrant ne correspond au scenario. Essaie d'elargir la maturite ou d'augmenter la limite.");
     }
 }
 
@@ -1176,6 +1470,29 @@ fn decision_action_label(decision: DecisionAction) -> &'static str {
         DecisionAction::TakeProfit => "TAKE",
         DecisionAction::Hold => "HOLD",
     }
+}
+
+fn scenario_side(side: &str, target_price: f64, spot: f64) -> &'static str {
+    match side {
+        "force-call" | "force-calls" => "call",
+        "force-put" | "force-puts" => "put",
+        _ if target_price >= spot => "call",
+        _ => "put",
+    }
+}
+
+fn parse_date_arg(value: &str) -> Option<NaiveDate> {
+    if value.trim().is_empty() || value == "-" {
+        return None;
+    }
+    NaiveDate::parse_from_str(value, "%Y-%m-%d").ok()
+}
+
+fn read_env_date(name: &str) -> Option<NaiveDate> {
+    std::env::var(name)
+        .ok()
+        .as_deref()
+        .and_then(parse_date_arg)
 }
 
 fn read_env_f64(name: &str) -> Option<f64> {

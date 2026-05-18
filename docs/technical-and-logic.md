@@ -929,3 +929,114 @@ Dans Ratatui:
 - ligne `Calc fees`: formule numerique appliquee au stop et a T2.
 
 Attention: ces frais broker ne remplacent pas le spread deja mesure dans le carnet, ni les frais implicites de financement/produit inclus par l'emetteur dans le prix du warrant/turbo. Ils servent a comparer le cout de passage d'ordre entre plateformes et a eviter qu'un edge de 1-2% soit transforme en faux signal par des frais fixes trop lourds sur un petit ordre.
+
+## Mode scenario: intention humaine et prevoyance
+
+La commande `scenario` sert a tester une these explicite:
+
+```text
+"Je vise RMS.PA a 1800 EUR le 2026-10-31 et je veux des warrants call
+avec une maturite debut 2027."
+```
+
+Commande type:
+
+```bash
+BROKER_FEE_PROFILE=bourse_direct_1000 FEE_ORDER_NOTIONAL=1000 \
+CANDLES_RANGE=60d CANDLES_INTERVAL=60m MARKET_DATA_REFRESH=cache \
+./manage.sh scenario hermes RMS.PA 1800 2026-10-31 2027-01-01 2027-03-31 call 500
+```
+
+Si le terminal est interactif, `manage.sh scenario` ouvre maintenant une vue Ratatui par defaut. Pour une sortie scriptable:
+
+```bash
+SCENARIO_FORMAT=table ./manage.sh scenario hermes RMS.PA 1800 2026-10-31 2027-01-01 2027-03-31 call 500
+```
+
+Logique:
+
+```text
+produits warrants nettoyes
+  -> filtre side call/put selon la these
+  -> filtre maturite apres la date cible
+  -> filtre fenetre de maturite voulue
+  -> prix d'entree = ask executable
+  -> projection Black-Scholes a la date cible
+  -> application des frais broker
+  -> calcul rendement net, point mort sous-jacent, score intentionnel
+```
+
+Champs principaux:
+
+| Champ | Sens |
+| --- | --- |
+| `targetPx` | Prix warrant estime a la date cible si le sous-jacent atteint le prix cible. |
+| `net%` | Rendement estime net de frais broker. |
+| `gross%` | Rendement brut avant frais. |
+| `BE` | Cours sous-jacent a atteindre a la date cible pour etre a l'equilibre net de frais. |
+| `fee%` | Cout total achat/depot/vente en pourcentage du montant d'ordre. |
+| `iv%` | Volatilite implicite actuelle quand elle est disponible. |
+| `score` | Score de coherence: rendement net, qualite de donnees, liquidite, spread, IV relative et fit de maturite. |
+
+Indicateurs mathematiques et statistiques ajoutes:
+
+| Champ | Formule | Lecture |
+| --- | --- | --- |
+| `PBE` | Probabilite lognormale que le sous-jacent atteigne le breakeven a la date cible. | Plus c'est haut, plus le point mort est statistiquement proche. |
+| `PTgt` | Probabilite lognormale que le sous-jacent atteigne le prix cible a la date cible. | Mesure la difficulte de la these selon vol et horizon. |
+| `zTarget` | `z=(ln(target/spot)-(r-q-0.5*sigma^2)T)/(sigma*sqrt(T))`. | Nombre d'ecarts-types lognormaux a franchir. |
+| `zBE` | Meme formule avec `level=breakeven`. | Effort statistique minimal pour ne pas perdre. |
+| `EV` | Valeur attendue risk-neutral du warrant a l'horizon cible, nette de frais, comparee au prix d'entree. | Detecte si le prix d'entree est cher/pas cher selon le modele, sans supposer que la cible arrive. |
+| `Sharpe-like` | `E[R] / std(R)` sur un modele binaire cible atteinte vs perte totale. | Indicateur simple rendement/risque, volontairement conservateur. |
+| `Kelly` | `max(0, (b*p-q)/b)` avec `b=gain/perte`, `p=P(target)`, `q=1-p`. | Taille theorique agressive; a lire comme plafond statistique, pas comme consigne. |
+| `Delta` | Delta Black-Scholes converti par `fx/parity`. | Variation theorique du warrant pour +1 unite de sous-jacent. |
+| `Gamma` | Gamma Black-Scholes converti par `fx/parity`. | Acceleration du delta. |
+| `Vega/pt` | Vega Black-Scholes pour +1 point de volatilite, converti par `fx/parity`. | Sensibilite a la volatilite implicite. |
+| `Theta/j` | Theta Black-Scholes annuel / 365, converti par `fx/parity`. | Cout temps quotidien theorique. |
+| `Rho/1%` | Rho Black-Scholes pour +1 point de taux, converti par `fx/parity`. | Sensibilite aux taux. |
+
+References de formule:
+
+- Black-Scholes: prix, `d1`, `d2` et sensibilites derivees du modele d'option europeenne.
+- NIST Normal Distribution: densite normale, fonction cumulative `Phi`, z-score.
+- William F. Sharpe: ratio rendement/variabilite.
+- J. L. Kelly: maximisation de la croissance logarithmique, fraction de capital.
+
+Decision:
+
+- `BUY`: le scenario est positif, liquide, executable, avec rendement net suffisant;
+- `WATCH`: le scenario est interessant mais fragile ou incomplet;
+- `AVOID`: rendement negatif, liquidite trop basse, spread trop large, point mort au-dela de la cible, ou donnees insuffisantes.
+
+Ce mode ne predit pas que le sous-jacent ira au prix cible. Il repond seulement a la question: "si mon intention de marche se realise, quel warrant exprime le mieux cette idee compte tenu du prix, de la maturite, de l'IV, de la liquidite et des frais ?"
+
+### Audit LLM Gemini
+
+Dans la vue Ratatui du mode `scenario`, l'onglet LLM ajoute une lecture qualitative par Gemini. Le LLM ne remplace pas les calculs: il audite le signal, cherche les incoherences, liste les risques et propose un verdict prudent.
+
+Touches:
+
+- `l`: bascule Notes / LLM Gemini.
+- `r`: interroge Gemini pour le warrant selectionne.
+- `Tab`, `Shift+Tab`, `←`, `→`, `n`, `p`, `t`, `e`: scroll dans l'onglet actif.
+
+Variables `.env`:
+
+```env
+LLM_ENABLE=1
+GEMINI_API_KEY=cle_1,cle_2
+GEMINI_MODEL=gemini-3.1-pro-preview
+GEMINI_BASE_URL=https://generativelanguage.googleapis.com
+LLM_CACHE=1
+LLM_CACHE_DIR=data/cache/llm
+```
+
+`GEMINI_API_KEY` accepte plusieurs cles separees par des virgules. En cas de `401`, `403`, `429`, erreur reseau ou erreur serveur `5xx`, le client essaie la cle suivante.
+
+Choix de modele:
+
+- `gemini-3.1-pro-preview`: modele haut de gamme actuel pour un audit pousse, mais en preview.
+- `gemini-2.5-pro`: option plus stable.
+- `gemini-2.5-flash`: option plus rapide et moins couteuse.
+
+Le contexte envoye est volontairement structure: sous-jacent, scenario, warrant, prix d'entree, projection, frais, probabilites, greeks, qualite de donnees, liquidite, spread et raisons du verdict quantitatif. La reponse demandee est un JSON strict pour rester affichable proprement.

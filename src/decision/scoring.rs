@@ -23,9 +23,8 @@ pub fn compute_confidence_score(
         .unwrap_or(50.0);
     let time_score = time_risk_score.clamp(0.0, 100.0);
 
-    signal.data_quality_score * 0.25
-        + signal.liquidity_score * 0.15
-        + spread_score * 0.15
+    signal.data_quality_score * 0.30
+        + spread_score * 0.20
         + peer_score * 0.10
         + edge_score * 0.15
         + reward_risk_score * 0.10
@@ -46,9 +45,6 @@ pub fn decide_action(
     }
     if signal.data_quality_score < config.min_data_quality_score {
         reasons.push("data_quality_too_low".to_string());
-    }
-    if signal.liquidity_score < config.min_liquidity_score {
-        reasons.push("liquidity_too_low".to_string());
     }
     if signal.spread_pct.unwrap_or(f64::INFINITY) > config.max_spread_pct {
         reasons.push("spread_too_wide".to_string());
@@ -166,6 +162,23 @@ mod tests {
 
         assert_eq!(decision, DecisionAction::Watch);
         assert!(warnings.contains(&"reward_risk_below_threshold".to_string()));
+    }
+
+    #[test]
+    fn low_trade_flow_does_not_make_signal_avoid() {
+        let signal = signal(2.4, Some(0.1), 95.0, 0.0, 10, Some(16.9));
+        let mut plan = plan();
+        plan.confidence_score = compute_confidence_score(
+            &signal,
+            plan.reward_risk_2,
+            plan.horizon.time_risk_score,
+            &DecisionConfig::default(),
+        );
+
+        let (decision, reasons, _) = decide_action(&signal, &plan, &DecisionConfig::default());
+
+        assert_ne!(decision, DecisionAction::Avoid);
+        assert!(!reasons.contains(&"liquidity_too_low".to_string()));
     }
 
     #[test]

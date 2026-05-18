@@ -15,6 +15,17 @@ pub struct BlackScholesInput {
     pub volatility: f64,
 }
 
+#[derive(Debug, Clone, Copy)]
+pub struct BlackScholesGreeks {
+    pub delta: f64,
+    pub gamma: f64,
+    pub vega_per_vol_point: f64,
+    pub theta_per_day: f64,
+    pub rho_per_rate_point: f64,
+    pub d1: f64,
+    pub d2: f64,
+}
+
 pub fn black_scholes_price(input: BlackScholesInput) -> Option<f64> {
     validate_positive(input.spot)?;
     validate_positive(input.strike)?;
@@ -36,6 +47,53 @@ pub fn black_scholes_price(input: BlackScholesInput) -> Option<f64> {
     };
 
     price.is_finite().then_some(price.max(0.0))
+}
+
+pub fn black_scholes_greeks(input: BlackScholesInput) -> Option<BlackScholesGreeks> {
+    validate_positive(input.spot)?;
+    validate_positive(input.strike)?;
+    validate_positive(input.years_to_maturity)?;
+    validate_positive(input.volatility)?;
+
+    let (d1, d2) = black_scholes_d1_d2(input)?;
+    let sqrt_t = input.years_to_maturity.sqrt();
+    let discounted_spot_factor = (-input.dividend_yield * input.years_to_maturity).exp();
+    let discounted_strike_factor = (-input.risk_free_rate * input.years_to_maturity).exp();
+    let pdf_d1 = normal_pdf(d1);
+    let delta = match input.kind {
+        OptionKind::Call => discounted_spot_factor * normal_cdf(d1),
+        OptionKind::Put => -discounted_spot_factor * normal_cdf(-d1),
+    };
+    let gamma = discounted_spot_factor * pdf_d1 / (input.spot * input.volatility * sqrt_t);
+    let vega_per_vol_point =
+        input.spot * discounted_spot_factor * pdf_d1 * sqrt_t / 100.0;
+    let theta_per_day = black_scholes_theta_per_year(input)? / 365.0;
+    let rho_per_rate_point = match input.kind {
+        OptionKind::Call => {
+            input.strike
+                * input.years_to_maturity
+                * discounted_strike_factor
+                * normal_cdf(d2)
+                / 100.0
+        }
+        OptionKind::Put => {
+            -input.strike
+                * input.years_to_maturity
+                * discounted_strike_factor
+                * normal_cdf(-d2)
+                / 100.0
+        }
+    };
+
+    Some(BlackScholesGreeks {
+        delta,
+        gamma,
+        vega_per_vol_point,
+        theta_per_day,
+        rho_per_rate_point,
+        d1,
+        d2,
+    })
 }
 
 pub fn black_scholes_theta_per_year(input: BlackScholesInput) -> Option<f64> {
@@ -134,6 +192,28 @@ pub fn implied_volatility(
     Some((low + high) / 2.0)
 }
 
+pub fn lognormal_probability(
+    kind: OptionKind,
+    spot: f64,
+    level: f64,
+    years: f64,
+    drift: f64,
+    volatility: f64,
+) -> Option<(f64, f64)> {
+    validate_positive(spot)?;
+    validate_positive(level)?;
+    validate_positive(years)?;
+    validate_positive(volatility)?;
+
+    let z = ((level / spot).ln() - (drift - 0.5 * volatility.powi(2)) * years)
+        / (volatility * years.sqrt());
+    let probability = match kind {
+        OptionKind::Call => 1.0 - normal_cdf(z),
+        OptionKind::Put => normal_cdf(z),
+    };
+    Some((probability.clamp(0.0, 1.0), z))
+}
+
 pub fn median_implied_volatility(values: impl IntoIterator<Item = Option<f64>>) -> Option<f64> {
     let mut vols = values
         .into_iter()
@@ -165,14 +245,29 @@ fn discounted_intrinsic(
     }
 }
 
-fn normal_cdf(x: f64) -> f64 {
+fn black_scholes_d1_d2(input: BlackScholesInput) -> Option<(f64, f64)> {
+    validate_positive(input.spot)?;
+    validate_positive(input.strike)?;
+    validate_positive(input.years_to_maturity)?;
+    validate_positive(input.volatility)?;
+
+    let sqrt_t = input.years_to_maturity.sqrt();
+    let d1 = ((input.spot / input.strike).ln()
+        + (input.risk_free_rate - input.dividend_yield + 0.5 * input.volatility.powi(2))
+            * input.years_to_maturity)
+        / (input.volatility * sqrt_t);
+    let d2 = d1 - input.volatility * sqrt_t;
+    Some((d1, d2))
+}
+
+pub fn normal_cdf(x: f64) -> f64 {
     // Abramowitz-Stegun approximation, sufficient for pricing diagnostics.
     let sign = if x < 0.0 { -1.0 } else { 1.0 };
     let z = x.abs() / 2.0_f64.sqrt();
     0.5 * (1.0 + sign * erf(z))
 }
 
-fn normal_pdf(x: f64) -> f64 {
+pub fn normal_pdf(x: f64) -> f64 {
     (-0.5 * x * x).exp() / (2.0 * std::f64::consts::PI).sqrt()
 }
 
@@ -248,6 +343,40 @@ mod tests {
         .unwrap();
 
         assert!(theta < 0.0, "theta={theta}");
+    }
+
+    #[test]
+    fn black_scholes_greeks_match_reference_signs_and_scales() {
+        let greeks = black_scholes_greeks(BlackScholesInput {
+            kind: OptionKind::Call,
+            spot: 100.0,
+            strike: 100.0,
+            years_to_maturity: 1.0,
+            risk_free_rate: 0.05,
+            dividend_yield: 0.0,
+            volatility: 0.20,
+        })
+        .unwrap();
+
+        assert_close(greeks.delta, 0.6368, 1e-3);
+        assert_close(greeks.gamma, 0.0188, 1e-3);
+        assert_close(greeks.vega_per_vol_point, 0.3752, 1e-3);
+        assert!(greeks.theta_per_day < 0.0);
+        assert!(greeks.rho_per_rate_point > 0.0);
+        assert!(greeks.d1 > greeks.d2);
+    }
+
+    #[test]
+    fn lognormal_probability_direction_depends_on_option_side() {
+        let call = lognormal_probability(OptionKind::Call, 100.0, 110.0, 1.0, 0.0, 0.20)
+            .unwrap();
+        let put = lognormal_probability(OptionKind::Put, 100.0, 90.0, 1.0, 0.0, 0.20)
+            .unwrap();
+
+        assert!(call.0 > 0.20 && call.0 < 0.40, "call={call:?}");
+        assert!(put.0 > 0.20 && put.0 < 0.40, "put={put:?}");
+        assert!(call.1.is_finite());
+        assert!(put.1.is_finite());
     }
 
     #[test]
