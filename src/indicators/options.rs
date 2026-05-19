@@ -214,6 +214,36 @@ pub fn lognormal_probability(
     Some((probability.clamp(0.0, 1.0), z))
 }
 
+pub fn first_touch_probability(
+    kind: OptionKind,
+    spot: f64,
+    level: f64,
+    years: f64,
+    drift: f64,
+    volatility: f64,
+) -> Option<f64> {
+    validate_positive(spot)?;
+    validate_positive(level)?;
+    validate_positive(years)?;
+    validate_positive(volatility)?;
+
+    match kind {
+        OptionKind::Call if level <= spot => return Some(1.0),
+        OptionKind::Put if level >= spot => return Some(1.0),
+        OptionKind::Call => {}
+        OptionKind::Put => {}
+    }
+
+    let log_barrier = (level / spot).ln();
+    let log_drift = drift - 0.5 * volatility.powi(2);
+    let probability = if log_barrier > 0.0 {
+        upper_first_touch_probability(log_barrier, years, log_drift, volatility)
+    } else {
+        upper_first_touch_probability(-log_barrier, years, -log_drift, volatility)
+    };
+    probability.is_finite().then_some(probability.clamp(0.0, 1.0))
+}
+
 pub fn median_implied_volatility(values: impl IntoIterator<Item = Option<f64>>) -> Option<f64> {
     let mut vols = values
         .into_iter()
@@ -258,6 +288,14 @@ fn black_scholes_d1_d2(input: BlackScholesInput) -> Option<(f64, f64)> {
         / (input.volatility * sqrt_t);
     let d2 = d1 - input.volatility * sqrt_t;
     Some((d1, d2))
+}
+
+fn upper_first_touch_probability(barrier: f64, years: f64, log_drift: f64, volatility: f64) -> f64 {
+    let sigma_sqrt_t = volatility * years.sqrt();
+    let left = normal_cdf((log_drift * years - barrier) / sigma_sqrt_t);
+    let right = ((2.0 * log_drift * barrier) / volatility.powi(2)).exp()
+        * normal_cdf((-log_drift * years - barrier) / sigma_sqrt_t);
+    left + right
 }
 
 pub fn normal_cdf(x: f64) -> f64 {
@@ -377,6 +415,29 @@ mod tests {
         assert!(put.0 > 0.20 && put.0 < 0.40, "put={put:?}");
         assert!(call.1.is_finite());
         assert!(put.1.is_finite());
+    }
+
+    #[test]
+    fn first_touch_probability_is_above_terminal_probability_for_otm_target() {
+        let terminal = lognormal_probability(OptionKind::Call, 100.0, 110.0, 1.0, 0.0, 0.20)
+            .unwrap()
+            .0;
+        let touch =
+            first_touch_probability(OptionKind::Call, 100.0, 110.0, 1.0, 0.0, 0.20).unwrap();
+
+        assert!(touch > terminal, "touch={touch}, terminal={terminal}");
+        assert!(touch <= 1.0);
+    }
+
+    #[test]
+    fn first_touch_probability_is_one_when_level_already_crossed() {
+        let call = first_touch_probability(OptionKind::Call, 100.0, 95.0, 1.0, 0.0, 0.20)
+            .unwrap();
+        let put = first_touch_probability(OptionKind::Put, 100.0, 105.0, 1.0, 0.0, 0.20)
+            .unwrap();
+
+        assert_eq!(call, 1.0);
+        assert_eq!(put, 1.0);
     }
 
     #[test]

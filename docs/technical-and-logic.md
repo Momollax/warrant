@@ -1025,7 +1025,7 @@ Variables `.env`:
 ```env
 LLM_ENABLE=1
 GEMINI_API_KEY=cle_1,cle_2
-GEMINI_MODEL=gemini-3.1-pro-preview
+GEMINI_MODEL=gemini-3-pro-preview
 GEMINI_BASE_URL=https://generativelanguage.googleapis.com
 LLM_CACHE=1
 LLM_CACHE_DIR=data/cache/llm
@@ -1035,8 +1035,18 @@ LLM_CACHE_DIR=data/cache/llm
 
 Choix de modele:
 
-- `gemini-3.1-pro-preview`: modele haut de gamme actuel pour un audit pousse, mais en preview.
+- `gemini-3-pro-preview`: modele haut de gamme actuel pour un audit pousse, mais en preview.
 - `gemini-2.5-pro`: option plus stable.
 - `gemini-2.5-flash`: option plus rapide et moins couteuse.
 
-Le contexte envoye est volontairement structure: sous-jacent, scenario, warrant, prix d'entree, projection, frais, probabilites, greeks, qualite de donnees, liquidite, spread et raisons du verdict quantitatif. La reponse demandee est un JSON strict pour rester affichable proprement.
+Le contexte envoye est volontairement structure: sous-jacent, scenario, warrant, prix d'entree, projection, frais, probabilites first-touch et terminales, greeks actuels et projetes, stress IV/FX, dividendes discrets, qualite de donnees, flow informatif, bid/ask, spread et raisons du verdict quantitatif. La reponse demandee est un JSON strict pour rester affichable proprement.
+
+La reponse LLM est decoupee en sections directement utiles dans l'interface: drivers du verdict, red flags, risques principaux, checks d'execution, problemes de donnees, revue du plan, conditions d'invalidation et questions avant entree. Le flow/volume observe ne doit jamais etre utilise comme raison de decision, car l'execution de ces produits depend surtout du market maker, du bid/ask executable, du spread, des tailles affichees, du statut et de la fraicheur des donnees.
+
+Implementation:
+
+- les regles de comportement sont envoyees dans `systemInstruction`;
+- le prompt utilisateur contient le JSON de contexte et le schema attendu;
+- `responseSchema` force une reponse JSON structuree;
+- le cache LLM utilise un SHA-256 stable sur le modele, le system prompt et le prompt utilisateur;
+- si Gemini renvoie `promptFeedback.blockReason`, l'interface affiche une erreur explicite au lieu d'un message generique.

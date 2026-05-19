@@ -2,6 +2,8 @@
 
 Outil Rust/Docker pour recuperer et analyser des produits structures lies a un sous-jacent comme Hermes.
 
+![Apercu de l'application](docs/image.png)
+
 La documentation principale est ici:
 
 - [Documentation de l'application](docs/application-documentation.md)

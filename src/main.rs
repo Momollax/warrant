@@ -1,3 +1,5 @@
+#![recursion_limit = "256"]
+
 mod analysis;
 mod api;
 mod config;
@@ -24,13 +26,13 @@ use api::discover::discover_by_underlying;
 use api::orats::OratsClient;
 use api::polygon::PolygonClient;
 use config::{resolve_max_cycles, resolve_tickers, REFRESH_INTERVAL_SECS};
-use chrono::{NaiveDate, Utc};
+use chrono::{Local, NaiveDate, Timelike, Utc};
 use decision::config::DecisionConfig;
 use decision::market_indicators::compute_market_indicators;
 use decision::models::{DecisionAction, DecisionSignal, MarketContext};
 use decision::scenario::{
-    analyze_warrant_scenario, default_max_maturity_for_early_next_year, ScenarioCandidate,
-    ScenarioConfig,
+    analyze_warrant_scenario, default_max_maturity_for_early_next_year, DiscreteDividend,
+    ScenarioCandidate, ScenarioConfig,
 };
 use decision::trade_plan::build_trade_plan;
 use futures::{stream, StreamExt};
@@ -504,6 +506,23 @@ async fn run_scenario(
         risk_free_rate: market_context.risk_free_rate,
         dividend_yield: market_context.dividend_yield,
         fallback_volatility: market_context.realized_volatility_20d.unwrap_or(0.35),
+        volatility_shock_points: read_env_f64("SCENARIO_VOL_SHOCK_POINTS").unwrap_or(-5.0),
+        real_world_drift: read_env_f64("SCENARIO_REAL_DRIFT_PCT")
+            .map(|value| value / 100.0)
+            .unwrap_or(market_context.risk_free_rate - market_context.dividend_yield),
+        fx_target_rate: read_env_f64("SCENARIO_FX_TARGET_RATE"),
+        fx_stress_pct: read_env_f64("SCENARIO_FX_STRESS_PCT").unwrap_or(0.0),
+        vol_spot_slope_points_per_pct: read_env_f64("SCENARIO_VOL_SPOT_SLOPE_POINTS_PER_PCT")
+            .unwrap_or(-0.50),
+        exit_spread_multiplier: read_env_f64("SCENARIO_EXIT_SPREAD_MULTIPLIER")
+            .unwrap_or(1.5),
+        exit_spread_delta_penalty: read_env_f64("SCENARIO_EXIT_SPREAD_DELTA_PENALTY")
+            .unwrap_or(0.75),
+        stale_pricing_guard: env_flag("SCENARIO_STALE_PRICING_GUARD").unwrap_or(true),
+        paris_hour: read_env_f64("SCENARIO_PARIS_HOUR")
+            .map(|value| value as u32)
+            .or_else(|| Some(Local::now().hour())),
+        dividends: read_env_dividends("SCENARIO_DIVIDENDS"),
     };
     let today = Utc::now().date_naive();
     let candidates = analyze_warrant_scenario(
@@ -1500,6 +1519,32 @@ fn read_env_f64(name: &str) -> Option<f64> {
         .ok()
         .and_then(|value| value.parse::<f64>().ok())
         .filter(|value| value.is_finite())
+}
+
+fn env_flag(name: &str) -> Option<bool> {
+    std::env::var(name).ok().map(|value| {
+        matches!(
+            value.trim().to_ascii_lowercase().as_str(),
+            "1" | "true" | "yes" | "on"
+        )
+    })
+}
+
+fn read_env_dividends(name: &str) -> Vec<DiscreteDividend> {
+    std::env::var(name)
+        .ok()
+        .map(|value| {
+            value
+                .split(',')
+                .filter_map(|item| {
+                    let (date, amount) = item.trim().split_once(':')?;
+                    let ex_date = NaiveDate::parse_from_str(date.trim(), "%Y-%m-%d").ok()?;
+                    let amount = amount.trim().parse::<f64>().ok()?;
+                    (amount > 0.0).then_some(DiscreteDividend { ex_date, amount })
+                })
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 fn format_float(value: f64) -> String {

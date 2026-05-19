@@ -1,19 +1,18 @@
-use std::collections::hash_map::DefaultHasher;
 use std::fs;
-use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 
 use anyhow::{anyhow, Context, Result};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 
 use crate::api::keyring::ApiKeyRing;
 use crate::decision::scenario::{ScenarioCandidate, ScenarioConfig};
 use crate::models::warrant::WarrantSnapshot;
 
 const DEFAULT_GEMINI_BASE_URL: &str = "https://generativelanguage.googleapis.com";
-const DEFAULT_GEMINI_MODEL: &str = "gemini-3.1-pro-preview";
+const DEFAULT_GEMINI_MODEL: &str = "gemini-3-pro-preview";
 const DEFAULT_CACHE_DIR: &str = "data/cache/llm";
 
 #[derive(Debug, Clone)]
@@ -31,9 +30,17 @@ pub struct LlmScenarioReview {
     pub verdict: String,
     pub confidence: u8,
     pub summary: String,
+    #[serde(default)]
+    pub decision_drivers: Vec<String>,
+    #[serde(default)]
+    pub red_flags: Vec<String>,
     pub main_risks: Vec<String>,
+    #[serde(default)]
+    pub execution_checks: Vec<String>,
     pub data_issues: Vec<String>,
     pub trade_plan_review: String,
+    #[serde(default)]
+    pub invalidation_conditions: Vec<String>,
     pub questions_before_entry: Vec<String>,
 }
 
@@ -83,8 +90,10 @@ pub async fn analyze_scenario_candidate(
         return Err(anyhow!(reason));
     }
 
+    let system_instruction = gemini_system_instruction();
     let prompt = build_scenario_prompt(underlying, scenario, candidate);
-    let cache_path = cache_path(&config.cache_dir, &config.model, &prompt);
+    let cache_material = format!("{system_instruction}\n\n{prompt}");
+    let cache_path = cache_path(&config.cache_dir, &config.model, &cache_material);
     if config.cache_enabled {
         if let Ok(cached) = fs::read_to_string(&cache_path) {
             let review = parse_review(&cached).context("cache LLM Gemini invalide")?;
@@ -93,6 +102,9 @@ pub async fn analyze_scenario_candidate(
     }
 
     let payload = json!({
+        "systemInstruction": {
+            "parts": [{ "text": system_instruction }]
+        },
         "contents": [{
             "role": "user",
             "parts": [{ "text": prompt }]
@@ -108,18 +120,26 @@ pub async fn analyze_scenario_candidate(
                     "verdict": { "type": "STRING" },
                     "confidence": { "type": "INTEGER" },
                     "summary": { "type": "STRING" },
+                    "decision_drivers": { "type": "ARRAY", "items": { "type": "STRING" } },
+                    "red_flags": { "type": "ARRAY", "items": { "type": "STRING" } },
                     "main_risks": { "type": "ARRAY", "items": { "type": "STRING" } },
+                    "execution_checks": { "type": "ARRAY", "items": { "type": "STRING" } },
                     "data_issues": { "type": "ARRAY", "items": { "type": "STRING" } },
                     "trade_plan_review": { "type": "STRING" },
+                    "invalidation_conditions": { "type": "ARRAY", "items": { "type": "STRING" } },
                     "questions_before_entry": { "type": "ARRAY", "items": { "type": "STRING" } }
                 },
                 "required": [
                     "verdict",
                     "confidence",
                     "summary",
+                    "decision_drivers",
+                    "red_flags",
                     "main_risks",
+                    "execution_checks",
                     "data_issues",
                     "trade_plan_review",
+                    "invalidation_conditions",
                     "questions_before_entry"
                 ]
             }
@@ -158,7 +178,7 @@ pub fn build_scenario_prompt(
     candidate: &ScenarioCandidate,
 ) -> String {
     let context = json!({
-        "role": "Tu es un auditeur de signaux sur warrants. Tu ne donnes pas d'ordre financier; tu controles la coherence du signal, les risques, les donnees manquantes et les points a verifier avant execution.",
+        "audit_version": 2,
         "underlying": {
             "ticker": underlying.ticker,
             "price": underlying.price,
@@ -173,7 +193,19 @@ pub fn build_scenario_prompt(
             "max_maturity": scenario.max_maturity.map(|date| date.to_string()),
             "risk_free_rate": scenario.risk_free_rate,
             "dividend_yield": scenario.dividend_yield,
-            "fallback_volatility": scenario.fallback_volatility
+            "fallback_volatility": scenario.fallback_volatility,
+            "volatility_shock_points": scenario.volatility_shock_points,
+            "real_world_drift": scenario.real_world_drift,
+            "fx_target_rate": scenario.fx_target_rate,
+            "fx_stress_pct": scenario.fx_stress_pct,
+            "vol_spot_slope_points_per_pct": scenario.vol_spot_slope_points_per_pct,
+            "exit_spread_multiplier": scenario.exit_spread_multiplier,
+            "exit_spread_delta_penalty": scenario.exit_spread_delta_penalty,
+            "stale_pricing_guard": scenario.stale_pricing_guard,
+            "dividends": scenario.dividends.iter().map(|dividend| json!({
+                "ex_date": dividend.ex_date.to_string(),
+                "amount": dividend.amount
+            })).collect::<Vec<_>>()
         },
         "candidate": {
             "decision": candidate.decision,
@@ -186,30 +218,50 @@ pub fn build_scenario_prompt(
             "maturity": candidate.maturity.to_string(),
             "entry_price": candidate.entry_price,
             "projected_price_at_target": candidate.projected_price,
+            "projected_bid_price_at_target": candidate.projected_bid_price,
+            "stressed_projected_price_at_target": candidate.stressed_projected_price,
+            "fx_stressed_projected_price_at_target": candidate.fx_stressed_projected_price,
             "net_return_pct": candidate.net_return_pct,
+            "stressed_net_return_pct": candidate.stressed_net_return_pct,
+            "fx_stressed_net_return_pct": candidate.fx_stressed_net_return_pct,
             "gross_return_pct": candidate.gross_return_pct,
             "fee_drag_pct": candidate.fee_drag_pct,
             "breakeven_underlying": candidate.breakeven_underlying,
             "breakeven_distance_pct": candidate.breakeven_distance_pct,
             "implied_volatility": candidate.implied_volatility,
-            "volatility_used": candidate.volatility_used,
+            "entry_volatility_used": candidate.volatility_used,
+            "exit_volatility_used": candidate.exit_volatility,
+            "dynamic_volatility_shift_points": candidate.dynamic_volatility_shift_points,
+            "volatility_shock_points": candidate.volatility_shock_points,
             "theta_horizon_pct": candidate.theta_horizon_pct,
             "spread_pct": candidate.spread_pct,
-            "probability_target_pct": candidate.probability_target_pct,
-            "probability_breakeven_pct": candidate.probability_breakeven_pct,
+            "first_touch_probability_target_pct_real_world": candidate.probability_target_pct,
+            "first_touch_probability_breakeven_pct_real_world": candidate.probability_breakeven_pct,
+            "terminal_probability_target_pct_risk_neutral": candidate.terminal_probability_target_pct,
+            "terminal_probability_breakeven_pct_risk_neutral": candidate.terminal_probability_breakeven_pct,
             "expected_value_pct": candidate.expected_value_pct,
             "sharpe_like": candidate.sharpe_like,
-            "kelly_fraction_pct": candidate.kelly_fraction_pct,
+            "kelly_fraction_pct_tp_sl_bounded": candidate.kelly_fraction_pct,
             "delta": candidate.delta,
             "gamma": candidate.gamma,
+            "target_delta": candidate.target_delta,
+            "target_gamma": candidate.target_gamma,
             "vega_per_vol_point": candidate.vega_per_vol_point,
+            "target_vega_per_vol_point": candidate.target_vega_per_vol_point,
             "theta_per_day": candidate.theta_per_day,
+            "target_theta_per_day": candidate.target_theta_per_day,
             "rho_per_rate_point": candidate.rho_per_rate_point,
             "data_quality_score": candidate.data_quality_score,
             "flow_score_informational_only": candidate.liquidity_score,
             "flow_score_note": "Flux/volume entre intervenants observe. Pour ces produits, il est informatif uniquement: l'execution depend surtout du market maker, du bid/ask, du spread et du statut de cotation. Ce champ ne doit pas servir a conclure sur l'entree ou la sortie.",
             "parity": candidate.parity,
-            "reasons": candidate.reasons
+            "fx_entry_rate": candidate.fx_rate,
+            "fx_exit_rate": candidate.fx_exit_rate,
+            "fx_stressed_exit_rate": candidate.fx_stressed_exit_rate,
+            "effective_exit_spread_multiplier": candidate.effective_exit_spread_multiplier,
+            "discrete_dividend_pv": candidate.discrete_dividend_pv,
+            "reasons": candidate.reasons,
+            "warnings": candidate.warnings
         }
     });
 
@@ -217,13 +269,24 @@ pub fn build_scenario_prompt(
         "Analyse ce warrant en francais a partir du JSON ci-dessous.\n\
          Reponds uniquement en JSON valide avec ce schema exact:\n\
          {{\"verdict\":\"BUY|WATCH|AVOID\",\"confidence\":0-100,\"summary\":\"...\",\
-         \"main_risks\":[\"...\"],\"data_issues\":[\"...\"],\
-         \"trade_plan_review\":\"...\",\"questions_before_entry\":[\"...\"]}}\n\
-         Regle importante: ne considere jamais flow_score_informational_only comme une raison de BUY/WATCH/AVOID. N'utilise pas ce score pour conclure a un probleme d'execution ou de carnet; pour ces produits, le flux/volume est informatif seulement car l'investisseur traite surtout contre le market maker. Les vrais criteres d'execution sont bid/ask executable, spread, taille affichee si disponible, statut de cotation et fraicheur des donnees.\n\
-         Le verdict doit rester prudent: si donnees manquantes, spread large, EV/Kelly faibles ou prix non executable, favorise WATCH/AVOID.\n\
+         \"decision_drivers\":[\"...\"],\"red_flags\":[\"...\"],\"main_risks\":[\"...\"],\
+         \"execution_checks\":[\"...\"],\"data_issues\":[\"...\"],\
+         \"trade_plan_review\":\"...\",\"invalidation_conditions\":[\"...\"],\
+         \"questions_before_entry\":[\"...\"]}}\n\
          JSON contexte:\n{}",
         serde_json::to_string_pretty(&context).unwrap_or_else(|_| "{}".to_string())
     )
+}
+
+fn gemini_system_instruction() -> &'static str {
+    "Tu es un auditeur de signaux sur warrants. Tu ne donnes pas d'ordre financier; tu controles la coherence du signal, les risques, les donnees manquantes et les points a verifier avant execution.\n\
+     Methode obligatoire:\n\
+     1. Respecte le verdict quantitatif sauf incoherence manifeste. Si tu contredis le moteur, explique pourquoi dans red_flags.\n\
+     2. Base le verdict sur: rendement net, P/L EUR, stress IV, stress FX, breakeven, first-touch, spread de sortie, bid/ask executable, stale pricing, dividendes discrets, greeks projetes et data quality.\n\
+     3. Ne considere jamais flow_score_informational_only comme une raison de BUY/WATCH/AVOID. Le flux/volume est informatif seulement; les vrais criteres d'execution sont bid/ask, spread, tailles, statut et fraicheur des donnees.\n\
+     4. Distingue probabilite first-touch monde reel et probabilite terminale risque-neutre. Ne presente pas le Kelly comme une certitude.\n\
+     5. Sois concis: max 2 phrases pour summary, 3 a 5 items par liste, pas de conseil financier direct.\n\
+     6. Favorise WATCH/AVOID si donnees manquantes, spread large, EV/Kelly faibles, risque FX/IV fort, stale pricing, prix non executable ou target avant breakeven."
 }
 
 pub fn parse_review(raw: &str) -> Result<LlmScenarioReview> {
@@ -241,9 +304,13 @@ pub fn parse_review(raw: &str) -> Result<LlmScenarioReview> {
         verdict: "WATCH".to_string(),
         confidence: 0,
         summary: "Gemini a repondu, mais pas dans le JSON strict attendu. L'analyse brute est affichee dans les problemes de donnees.".to_string(),
+        decision_drivers: vec!["Reponse non structuree: utiliser uniquement le moteur quantitatif.".to_string()],
+        red_flags: vec!["Reponse LLM non structuree ou tronquee.".to_string()],
         main_risks: vec!["Reponse LLM non structuree ou tronquee; ne pas utiliser cet avis comme signal.".to_string()],
+        execution_checks: vec!["Relancer Gemini ou verifier le bid/ask manuellement.".to_string()],
         data_issues: vec![format!("Extrait brut Gemini: {}", compact_excerpt(&cleaned, 900))],
         trade_plan_review: "Relance l'analyse avec r. Si le probleme persiste, utilise gemini-2.5-pro ou gemini-2.5-flash, ou reduis le contexte envoye.".to_string(),
+        invalidation_conditions: vec!["Avis LLM invalide tant que la reponse n'est pas structuree.".to_string()],
         questions_before_entry: vec![
             "La reponse Gemini est-elle complete apres relance ?".to_string(),
             "Le verdict quantitatif reste-t-il coherent sans l'avis LLM ?".to_string(),
@@ -254,8 +321,12 @@ pub fn parse_review(raw: &str) -> Result<LlmScenarioReview> {
 fn sanitize_review(mut review: LlmScenarioReview) -> LlmScenarioReview {
     review.summary = sanitize_liquidity_language(&review.summary);
     review.trade_plan_review = sanitize_liquidity_language(&review.trade_plan_review);
+    review.decision_drivers = sanitize_review_list(review.decision_drivers);
+    review.red_flags = sanitize_review_list(review.red_flags);
     review.main_risks = sanitize_review_list(review.main_risks);
+    review.execution_checks = sanitize_review_list(review.execution_checks);
     review.data_issues = sanitize_review_list(review.data_issues);
+    review.invalidation_conditions = sanitize_review_list(review.invalidation_conditions);
     review.questions_before_entry = sanitize_review_list(review.questions_before_entry);
     review
 }
@@ -357,6 +428,16 @@ fn compact_excerpt(raw: &str, max_chars: usize) -> String {
 }
 
 fn extract_gemini_text(value: &Value) -> Result<String> {
+    if let Some(block_reason) = value
+        .get("promptFeedback")
+        .and_then(|feedback| feedback.get("blockReason"))
+    {
+        return Err(anyhow!(
+            "Gemini a bloque la requete (safety/filter): {}",
+            block_reason
+        ));
+    }
+
     value
         .get("candidates")
         .and_then(|candidates| candidates.as_array())
@@ -368,14 +449,20 @@ fn extract_gemini_text(value: &Value) -> Result<String> {
         .and_then(|part| part.get("text"))
         .and_then(|text| text.as_str())
         .map(str::to_string)
-        .ok_or_else(|| anyhow!("Gemini n'a pas renvoye de texte exploitable"))
+        .ok_or_else(|| {
+            anyhow!(
+                "Gemini n'a pas renvoye de texte exploitable. Payload: {}",
+                compact_excerpt(&value.to_string(), 1200)
+            )
+        })
 }
 
 fn cache_path(cache_dir: &Path, model: &str, prompt: &str) -> PathBuf {
-    let mut hasher = DefaultHasher::new();
-    model.hash(&mut hasher);
-    prompt.hash(&mut hasher);
-    cache_dir.join(format!("{:016x}.json", hasher.finish()))
+    let mut hasher = Sha256::new();
+    hasher.update(model.as_bytes());
+    hasher.update(b"\0");
+    hasher.update(prompt.as_bytes());
+    cache_dir.join(format!("{:x}.json", hasher.finalize()))
 }
 
 fn env_flag(name: &str) -> Option<bool> {
@@ -432,16 +519,62 @@ Fin."#,
     }
 
     #[test]
-    fn prompt_contains_candidate_and_prudence_rules() {
+    fn prompt_contains_candidate_and_system_rules_are_separated() {
         let prompt = build_scenario_prompt(&underlying(), &scenario(), &candidate());
+        let system = gemini_system_instruction();
 
         assert!(prompt.contains("\"symbol\": \"D12QS\""));
         assert!(prompt.contains("\"target_price\": 330.0"));
-        assert!(prompt.contains("favorise WATCH/AVOID"));
         assert!(prompt.contains("flow_score_informational_only"));
-        assert!(prompt.contains("ne considere jamais flow_score_informational_only"));
+        assert!(system.to_lowercase().contains("favorise watch/avoid"));
+        assert!(system.contains("flow_score_informational_only"));
+        assert!(system
+            .to_lowercase()
+            .contains("ne considere jamais flow_score_informational_only"));
+        assert!(!prompt.contains("Methode obligatoire"));
         assert!(!prompt.contains("\"liquidity_score\""));
         assert!(!prompt.contains("liquidite faible"));
+    }
+
+    #[test]
+    fn cache_path_uses_stable_sha256_hex() {
+        let path = cache_path(Path::new("data/cache/llm"), "gemini-3-pro-preview", "abc");
+        let file_name = path.file_name().unwrap().to_string_lossy();
+
+        assert_eq!(file_name.len(), 69);
+        assert!(file_name.ends_with(".json"));
+        assert!(file_name
+            .trim_end_matches(".json")
+            .chars()
+            .all(|ch| ch.is_ascii_hexdigit()));
+        assert_eq!(
+            path,
+            cache_path(Path::new("data/cache/llm"), "gemini-3-pro-preview", "abc")
+        );
+    }
+
+    #[test]
+    fn extract_gemini_text_reports_prompt_feedback_block_reason() {
+        let value = json!({
+            "promptFeedback": {
+                "blockReason": "SAFETY"
+            }
+        });
+
+        let error = extract_gemini_text(&value).unwrap_err().to_string();
+
+        assert!(error.contains("Gemini a bloque la requete"));
+        assert!(error.contains("SAFETY"));
+    }
+
+    #[test]
+    fn extract_gemini_text_reports_unexpected_payload_excerpt() {
+        let value = json!({ "unexpected": true });
+
+        let error = extract_gemini_text(&value).unwrap_err().to_string();
+
+        assert!(error.contains("Payload:"));
+        assert!(error.contains("unexpected"));
     }
 
     #[test]
@@ -450,13 +583,20 @@ Fin."#,
             verdict: "WATCH".to_string(),
             confidence: 80,
             summary: "Liquidite faible sur ce produit.".to_string(),
+            decision_drivers: vec![
+                "Rendement net positif".to_string(),
+                "Flow faible mais informatif seulement".to_string(),
+            ],
+            red_flags: vec!["liquidity risk".to_string()],
             main_risks: vec![
                 "Liquidite insuffisante".to_string(),
                 "Spread large".to_string(),
                 "liquidity risk".to_string(),
             ],
+            execution_checks: vec!["Verifier liquidite du carnet".to_string()],
             data_issues: vec!["Aucun probleme".to_string()],
             trade_plan_review: "Plan coherent, mais liquidite faible.".to_string(),
+            invalidation_conditions: vec!["Liquidite insuffisante".to_string()],
             questions_before_entry: vec![
                 "La liquidite permet-elle de sortir ?".to_string(),
                 "Le spread est-il stable ?".to_string(),
@@ -499,6 +639,16 @@ Fin."#,
             risk_free_rate: 0.045,
             dividend_yield: 0.005,
             fallback_volatility: 0.28,
+            volatility_shock_points: -5.0,
+            real_world_drift: 0.08,
+            fx_target_rate: None,
+            fx_stress_pct: 0.0,
+            vol_spot_slope_points_per_pct: -0.50,
+            exit_spread_multiplier: 1.5,
+            exit_spread_delta_penalty: 0.75,
+            stale_pricing_guard: false,
+            paris_hour: None,
+            dividends: Vec::new(),
         }
     }
 
@@ -514,33 +664,53 @@ Fin."#,
             maturity: NaiveDate::from_ymd_opt(2027, 3, 19).unwrap(),
             entry_price: 3.8,
             projected_price: 5.01,
+            projected_bid_price: 4.97,
+            stressed_projected_price: Some(4.42),
+            fx_stressed_projected_price: None,
             net_return_pct: 31.36,
+            stressed_net_return_pct: Some(15.8),
+            fx_stressed_net_return_pct: None,
             gross_return_pct: 31.8,
             fee_drag_pct: 0.38,
             breakeven_underlying: Some(313.26),
             breakeven_distance_pct: Some(5.37),
             implied_volatility: Some(0.2837),
             volatility_used: 0.2837,
+            exit_volatility: 0.2637,
+            dynamic_volatility_shift_points: -2.0,
+            volatility_shock_points: -5.0,
             theta_horizon_pct: Some(0.0),
             spread_pct: Some(0.53),
             probability_target_pct: Some(29.25),
             probability_breakeven_pct: Some(39.2),
+            terminal_probability_target_pct: Some(18.0),
+            terminal_probability_breakeven_pct: Some(25.0),
             target_zscore: Some(0.546),
             breakeven_zscore: Some(0.274),
             expected_value_pct: Some(1.68),
             sharpe_like: Some(-1.03),
             kelly_fraction_pct: Some(0.0),
             delta: Some(0.0588),
+            target_delta: Some(0.0720),
             gamma: Some(0.000393),
+            target_gamma: Some(0.000320),
             vega_per_vol_point: Some(0.082),
+            target_vega_per_vol_point: Some(0.075),
             theta_per_day: Some(-0.005),
+            target_theta_per_day: Some(-0.004),
             rho_per_rate_point: Some(0.114),
             d1: Some(0.49),
             d2: Some(0.23),
             data_quality_score: 100.0,
             liquidity_score: 45.0,
             parity: 10.0,
+            fx_rate: 1.0,
+            fx_exit_rate: 1.0,
+            fx_stressed_exit_rate: None,
+            effective_exit_spread_multiplier: 1.5,
+            discrete_dividend_pv: 0.0,
             reasons: vec![],
+            warnings: vec![],
         }
     }
 }

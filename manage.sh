@@ -517,6 +517,17 @@ cmd_scenario() {
     local candles_interval="${CANDLES_INTERVAL:-60m}"
     local market_data_refresh="${MARKET_DATA_REFRESH:-cache}"
     local scenario_format="${SCENARIO_FORMAT:-table}"
+    local scenario_min_buy_return_pct="${SCENARIO_MIN_BUY_RETURN_PCT:-8}"
+    local scenario_min_buy_score="${SCENARIO_MIN_BUY_SCORE:-70}"
+    local scenario_min_buy_target_prob_pct="${SCENARIO_MIN_BUY_TARGET_PROB_PCT:-10}"
+    local scenario_min_buy_breakeven_prob_pct="${SCENARIO_MIN_BUY_BREAKEVEN_PROB_PCT:-20}"
+    local scenario_score_return_target_pct="${SCENARIO_SCORE_RETURN_TARGET_PCT:-20}"
+    local scenario_vol_shock_points="${SCENARIO_VOL_SHOCK_POINTS:--5}"
+    local scenario_fx_stress_pct="${SCENARIO_FX_STRESS_PCT:-0}"
+    local scenario_vol_spot_slope_points_per_pct="${SCENARIO_VOL_SPOT_SLOPE_POINTS_PER_PCT:--0.50}"
+    local scenario_exit_spread_multiplier="${SCENARIO_EXIT_SPREAD_MULTIPLIER:-1.5}"
+    local scenario_exit_spread_delta_penalty="${SCENARIO_EXIT_SPREAD_DELTA_PENALTY:-0.75}"
+    local scenario_stale_pricing_guard="${SCENARIO_STALE_PRICING_GUARD:-1}"
     local tty_args=()
     if [[ -t 0 && -t 1 ]]; then
         tty_args=(-it)
@@ -536,6 +547,21 @@ cmd_scenario() {
         -e "SCENARIO_MAX_MATURITY=${max_maturity}" \
         -e "SCENARIO_SIDE=${side}" \
         -e "SCENARIO_LIMIT=${limit}" \
+        -e "SCENARIO_MIN_BUY_RETURN_PCT=${scenario_min_buy_return_pct}" \
+        -e "SCENARIO_MIN_BUY_SCORE=${scenario_min_buy_score}" \
+        -e "SCENARIO_MIN_BUY_TARGET_PROB_PCT=${scenario_min_buy_target_prob_pct}" \
+        -e "SCENARIO_MIN_BUY_BREAKEVEN_PROB_PCT=${scenario_min_buy_breakeven_prob_pct}" \
+        -e "SCENARIO_SCORE_RETURN_TARGET_PCT=${scenario_score_return_target_pct}" \
+        -e "SCENARIO_VOL_SHOCK_POINTS=${scenario_vol_shock_points}" \
+        -e "SCENARIO_FX_STRESS_PCT=${scenario_fx_stress_pct}" \
+        -e "SCENARIO_VOL_SPOT_SLOPE_POINTS_PER_PCT=${scenario_vol_spot_slope_points_per_pct}" \
+        -e "SCENARIO_EXIT_SPREAD_MULTIPLIER=${scenario_exit_spread_multiplier}" \
+        -e "SCENARIO_EXIT_SPREAD_DELTA_PENALTY=${scenario_exit_spread_delta_penalty}" \
+        -e "SCENARIO_STALE_PRICING_GUARD=${scenario_stale_pricing_guard}" \
+        ${SCENARIO_REAL_DRIFT_PCT:+-e "SCENARIO_REAL_DRIFT_PCT=${SCENARIO_REAL_DRIFT_PCT}"} \
+        ${SCENARIO_FX_TARGET_RATE:+-e "SCENARIO_FX_TARGET_RATE=${SCENARIO_FX_TARGET_RATE}"} \
+        ${SCENARIO_PARIS_HOUR:+-e "SCENARIO_PARIS_HOUR=${SCENARIO_PARIS_HOUR}"} \
+        ${SCENARIO_DIVIDENDS:+-e "SCENARIO_DIVIDENDS=${SCENARIO_DIVIDENDS}"} \
         -e "BOURSORAMA_ENRICH=${boursorama_enrich}" \
         -e "OPPORTUNITY_VALIDATE_BOURSORAMA=${validate_boursorama}" \
         -e "OPPORTUNITY_VALIDATE_LIMIT=${validate_limit}" \
@@ -638,7 +664,13 @@ ${BOLD}.env :${NC}
       FEE_DEPOSIT_FIXED, FEE_DEPOSIT_PCT,
       SCENARIO_TARGET_PRICE, SCENARIO_TARGET_DATE,
       SCENARIO_MIN_MATURITY, SCENARIO_MAX_MATURITY, SCENARIO_SIDE,
-      SCENARIO_FORMAT,
+      SCENARIO_FORMAT, SCENARIO_MIN_BUY_RETURN_PCT, SCENARIO_MIN_BUY_SCORE,
+      SCENARIO_MIN_BUY_TARGET_PROB_PCT, SCENARIO_MIN_BUY_BREAKEVEN_PROB_PCT,
+      SCENARIO_SCORE_RETURN_TARGET_PCT, SCENARIO_VOL_SHOCK_POINTS,
+      SCENARIO_REAL_DRIFT_PCT, SCENARIO_FX_TARGET_RATE, SCENARIO_FX_STRESS_PCT,
+      SCENARIO_VOL_SPOT_SLOPE_POINTS_PER_PCT, SCENARIO_EXIT_SPREAD_MULTIPLIER,
+      SCENARIO_EXIT_SPREAD_DELTA_PENALTY, SCENARIO_STALE_PRICING_GUARD,
+      SCENARIO_PARIS_HOUR, SCENARIO_DIVIDENDS,
       ORATS_API_KEY, POLYGON_API_KEY, GEMINI_API_KEY, GEMINI_MODEL,
       LLM_ENABLE, LLM_CACHE, BROWSER.
 

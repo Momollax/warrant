@@ -114,10 +114,16 @@ SCENARIO_TARGET_DATE=2026-10-31
 SCENARIO_MIN_MATURITY=2027-01-01
 SCENARIO_MAX_MATURITY=2027-03-31
 SCENARIO_SIDE=auto
+SCENARIO_MIN_BUY_RETURN_PCT=8
+SCENARIO_MIN_BUY_SCORE=70
+SCENARIO_MIN_BUY_TARGET_PROB_PCT=10
+SCENARIO_MIN_BUY_BREAKEVEN_PROB_PCT=20
+SCENARIO_SCORE_RETURN_TARGET_PCT=20
+SCENARIO_VOL_SHOCK_POINTS=-5
 
 LLM_ENABLE=0
 GEMINI_API_KEY=gemini_key_1,gemini_key_2
-GEMINI_MODEL=gemini-3.1-pro-preview
+GEMINI_MODEL=gemini-3-pro-preview
 LLM_CACHE=1
 ```
 
@@ -318,6 +324,44 @@ Quand `m` est utilise, l'application recalcule:
 - les decisions
 - l'affichage
 
+Colonnes utiles du mode scenario:
+
+- `Net`: rendement net projete apres frais au target
+- `P/L EUR`: gain/perte en euros pour `FEE_ORDER_NOTIONAL`
+- `Stress`: rendement net au target si l'IV baisse de `SCENARIO_VOL_SHOCK_POINTS`
+- `Str EUR`: gain/perte en euros du scenario stresse pour `FEE_ORDER_NOTIONAL`
+- `BE mv`: mouvement minimum du sous-jacent pour atteindre le point mort
+- `PBE`: probabilite d'atteindre le point mort
+- `PTgt`: probabilite d'atteindre la cible
+- `EV`: esperance risk-neutral
+- `Kelly`: Kelly binaire au target
+
+Quand l'ecran est assez large, le panneau Notes affiche aussi un graphique Ratatui de rentabilite:
+
+- axe X: mouvement du sous-jacent en %
+- axe Y: P/L net du produit en %
+- point blanc: entree actuelle, normalisee a `0%` de mouvement et `0%` de P/L
+- courbe cyan: rendement net projete a la date cible selon le niveau du sous-jacent
+- ligne rouge: stop loss theorique mark-to-market, calcule avec `DECISION_MAX_LOSS_PCT_PER_TRADE`
+- ligne jaune: point mort a la date cible, niveau a partir duquel le trade devient rentable apres frais
+- ligne/point vert: target/TP du scenario, avec rendement net apres frais
+- point magenta: target/TP avec stress de volatilite implicite
+
+Le graphe n'est pas une prediction du chemin du prix. Il sert a lire le plan:
+
+- acheter au point blanc si le produit reste executable
+- couper si le sous-jacent arrive sur la ligne rouge, car le produit atteindrait environ la perte maximale configuree maintenant
+- considerer le trade rentable apres la ligne jaune uniquement pour la date cible affichee
+- prendre le gain du scenario sur la ligne verte
+
+Le point mort jaune est calcule avec Black-Scholes a la date cible:
+
+```text
+net_return(BlackScholes(S_BE, K, T_target_to_maturity, r, q, vol) / parite * fx) = 0
+```
+
+Il est donc influence par la valeur temps restante, par l'IV utilisee, par les frais et par le spread. Si le sous-jacent atteint ce niveau plus tot ou plus tard que la date cible, le point mort reel peut etre different.
+
 ## 7. Concepts financiers utilises
 
 ### Bid, ask et spread
@@ -402,6 +446,21 @@ Ou:
 - `r`: taux sans risque
 - `q`: rendement dividende
 - `vol`: volatilite implicite si disponible, sinon fallback
+
+Ce calcul integre deja:
+
+- le compte a rebours: `T_target_to_maturity` diminue quand la date cible avance, donc la valeur temps restante baisse
+- le delta: Black-Scholes ne suppose pas un levier fixe; le prix reagit selon la position du warrant face au strike
+- le vega: le prix depend de `vol`
+
+Le moteur ajoute aussi un stress de volatilite:
+
+```text
+vol_stress = max(vol + SCENARIO_VOL_SHOCK_POINTS / 100, 0.0001)
+prix_stress = BlackScholes(side, S_target, K, T_target_to_maturity, r, q, vol_stress) / parite * fx
+```
+
+Avec la valeur par defaut `SCENARIO_VOL_SHOCK_POINTS=-5`, le panneau Notes affiche le rendement au target si l'IV baisse de 5 points. Si ce rendement devient negatif, la raison `volatility_crush_erases_return` bloque le `BUY`.
 
 ### Probabilites
 
@@ -512,6 +571,21 @@ Le moteur peut classer `BUY` si:
 - frais integres
 - reward/risk suffisant
 - pas de raison bloquante
+
+En mode `scenario`, les seuils sont configurables:
+
+```env
+SCENARIO_MIN_BUY_RETURN_PCT=8
+SCENARIO_MIN_BUY_SCORE=70
+SCENARIO_MIN_BUY_TARGET_PROB_PCT=10
+SCENARIO_MIN_BUY_BREAKEVEN_PROB_PCT=20
+SCENARIO_SCORE_RETURN_TARGET_PCT=20
+SCENARIO_VOL_SHOCK_POINTS=-5
+```
+
+Cela evite de forcer uniquement des scenarios tres lointains. Un mouvement du sous-jacent de 3-5% peut donc produire un `BUY` si le produit donne un rendement net suffisant, un spread faible, une data quality propre et une probabilite correcte.
+
+`SCENARIO_VOL_SHOCK_POINTS=-5` applique un stress de volatilite implicite de `-5 points` au target. Il sert a detecter le cas classique ou le sous-jacent va dans le bon sens mais ou la baisse d'IV efface la plus-value du warrant.
 
 ### WATCH
 
@@ -633,7 +707,7 @@ Variables:
 ```env
 LLM_ENABLE=1
 GEMINI_API_KEY=cle_1,cle_2
-GEMINI_MODEL=gemini-3.1-pro-preview
+GEMINI_MODEL=gemini-3-pro-preview
 LLM_CACHE=1
 ```
 
@@ -646,17 +720,22 @@ Gemini recoit:
 - le produit selectionne
 - les prix
 - les frais
-- les probabilites
-- les greeks
+- les probabilites first-touch et terminales
+- les greeks actuels et projetes
+- les stress IV et FX
+- les dividendes discrets connus
 - les raisons BUY/WATCH/AVOID
-- le flow en champ informatif uniquement
+- le flow en champ informatif uniquement, non decisif
 
 Regles importantes:
 
 - Gemini ne doit pas utiliser `Flow` comme raison de decision.
+- Gemini doit expliquer les drivers, red flags, checks d'execution et conditions d'invalidation.
 - L'avis LLM est qualitatif.
 - Le moteur quantitatif reste la source des calculs.
 - Les reponses Gemini sont cachees si `LLM_CACHE=1`.
+- Le cache LLM est indexe par SHA-256 sur le modele et les prompts; changer de modele ou de regles cree donc une nouvelle entree de cache.
+- Les blocages Gemini de type `promptFeedback.blockReason` sont affiches explicitement dans l'onglet LLM.
 
 Si une ancienne reponse reste affichee dans une session TUI, relancer l'application ou lancer une analyse avec:
 
@@ -834,4 +913,3 @@ Les evolutions les plus utiles:
    - comparer un signal dans le temps
    - detecter amelioration du spread
    - suivre evolution de IV et score
-
