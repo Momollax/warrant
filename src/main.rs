@@ -518,6 +518,11 @@ async fn run_scenario(
             .unwrap_or(1.5),
         exit_spread_delta_penalty: read_env_f64("SCENARIO_EXIT_SPREAD_DELTA_PENALTY")
             .unwrap_or(0.75),
+        linear_financing_rate: read_env_f64("SCENARIO_LINEAR_FINANCING_RATE_PCT")
+            .map(|value| value / 100.0)
+            .unwrap_or(0.0),
+        monte_carlo_paths: read_env_usize("SCENARIO_MC_PATHS").unwrap_or(512),
+        monte_carlo_max_steps: read_env_usize("SCENARIO_MC_MAX_STEPS").unwrap_or(128),
         stale_pricing_guard: env_flag("SCENARIO_STALE_PRICING_GUARD").unwrap_or(true),
         paris_hour: read_env_f64("SCENARIO_PARIS_HOUR")
             .map(|value| value as u32)
@@ -973,7 +978,7 @@ fn print_scenario_table(candidates: &[ScenarioCandidate], limit: usize) {
             truncate_display(&candidate.symbol, 10),
             candidate.side,
             candidate.strike,
-            candidate.maturity,
+            candidate.maturity_label,
             candidate.entry_price,
             candidate.projected_price,
             candidate.net_return_pct,
@@ -1519,6 +1524,12 @@ fn read_env_f64(name: &str) -> Option<f64> {
         .ok()
         .and_then(|value| value.parse::<f64>().ok())
         .filter(|value| value.is_finite())
+}
+
+fn read_env_usize(name: &str) -> Option<usize> {
+    std::env::var(name)
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
 }
 
 fn env_flag(name: &str) -> Option<bool> {

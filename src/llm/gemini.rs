@@ -212,10 +212,12 @@ pub fn build_scenario_prompt(
             "score": candidate.score,
             "symbol": candidate.symbol,
             "side": candidate.side,
+            "product_family": candidate.product_family,
+            "pricing_model": candidate.pricing_model,
             "product_type": candidate.product_type,
             "url": candidate.url,
             "strike": candidate.strike,
-            "maturity": candidate.maturity.to_string(),
+            "maturity": candidate.maturity_label,
             "entry_price": candidate.entry_price,
             "projected_price_at_target": candidate.projected_price,
             "projected_bid_price_at_target": candidate.projected_bid_price,
@@ -260,6 +262,24 @@ pub fn build_scenario_prompt(
             "fx_stressed_exit_rate": candidate.fx_stressed_exit_rate,
             "effective_exit_spread_multiplier": candidate.effective_exit_spread_multiplier,
             "discrete_dividend_pv": candidate.discrete_dividend_pv,
+            "projected_payoff_reference": candidate.projected_reference,
+            "projected_barrier": candidate.projected_barrier,
+            "financing_drag_pct": candidate.financing_drag_pct,
+            "barrier_touch_probability_pct": candidate.barrier_touch_probability_pct,
+            "monte_carlo": {
+                "target_first_pct": candidate.monte_carlo_target_first_pct,
+                "stop_first_pct": candidate.monte_carlo_stop_first_pct,
+                "knock_out_pct": candidate.monte_carlo_ko_pct,
+                "expected_return_pct": candidate.monte_carlo_expected_return_pct,
+                "p05_return_pct": candidate.monte_carlo_p05_return_pct,
+                "p50_return_pct": candidate.monte_carlo_p50_return_pct,
+                "p95_return_pct": candidate.monte_carlo_p95_return_pct
+            },
+            "linear_model_note": if candidate.pricing_model == "warrant_intrinsic" {
+                Value::Null
+            } else {
+                json!("Produit lineaire: IV/theta/vega Black-Scholes non utilises; projection basee sur reference projetee si SCENARIO_LINEAR_FINANCING_RATE_PCT est renseigne, sinon reference actuelle. Le risque barriere/KO et le Monte Carlo doivent primer sur l'IV.")
+            },
             "reasons": candidate.reasons,
             "warnings": candidate.warnings
         }
@@ -282,11 +302,12 @@ fn gemini_system_instruction() -> &'static str {
     "Tu es un auditeur de signaux sur warrants. Tu ne donnes pas d'ordre financier; tu controles la coherence du signal, les risques, les donnees manquantes et les points a verifier avant execution.\n\
      Methode obligatoire:\n\
      1. Respecte le verdict quantitatif sauf incoherence manifeste. Si tu contredis le moteur, explique pourquoi dans red_flags.\n\
-     2. Base le verdict sur: rendement net, P/L EUR, stress IV, stress FX, breakeven, first-touch, spread de sortie, bid/ask executable, stale pricing, dividendes discrets, greeks projetes et data quality.\n\
+     2. Base le verdict sur: rendement net, P/L EUR, stress IV, stress FX, breakeven, first-touch, KO%, Monte Carlo target/stop/KO, spread de sortie, bid/ask executable, stale pricing, dividendes discrets, greeks projetes et data quality.\n\
      3. Ne considere jamais flow_score_informational_only comme une raison de BUY/WATCH/AVOID. Le flux/volume est informatif seulement; les vrais criteres d'execution sont bid/ask, spread, tailles, statut et fraicheur des donnees.\n\
      4. Distingue probabilite first-touch monde reel et probabilite terminale risque-neutre. Ne presente pas le Kelly comme une certitude.\n\
      5. Sois concis: max 2 phrases pour summary, 3 a 5 items par liste, pas de conseil financier direct.\n\
-     6. Favorise WATCH/AVOID si donnees manquantes, spread large, EV/Kelly faibles, risque FX/IV fort, stale pricing, prix non executable ou target avant breakeven."
+     6. Favorise WATCH/AVOID si donnees manquantes, spread large, EV/Kelly faibles ou negatifs, risque FX/IV fort, stale pricing, prix non executable ou target avant breakeven.\n\
+     7. Pour les produits lineaires open-end, ne traite pas IV/theta/vega comme des criteres Black-Scholes. Si linear_model_note indique que le financement futur n'est pas projete sur un horizon long, cite ce point comme limite du signal plutot qu'un probleme de liquidite."
 }
 
 pub fn parse_review(raw: &str) -> Result<LlmScenarioReview> {
@@ -646,6 +667,9 @@ Fin."#,
             vol_spot_slope_points_per_pct: -0.50,
             exit_spread_multiplier: 1.5,
             exit_spread_delta_penalty: 0.75,
+            linear_financing_rate: 0.0,
+            monte_carlo_paths: 256,
+            monte_carlo_max_steps: 64,
             stale_pricing_guard: false,
             paris_hour: None,
             dividends: Vec::new(),
@@ -658,10 +682,13 @@ Fin."#,
             score: 53.0,
             symbol: "D12QS".to_string(),
             side: "call".to_string(),
+            product_family: "warrant".to_string(),
+            pricing_model: "warrant_intrinsic".to_string(),
             product_type: "Warrant Call".to_string(),
             url: "https://example.test".to_string(),
             strike: 280.0,
             maturity: NaiveDate::from_ymd_opt(2027, 3, 19).unwrap(),
+            maturity_label: "2027-03-19".to_string(),
             entry_price: 3.8,
             projected_price: 5.01,
             projected_bid_price: 4.97,
@@ -709,6 +736,17 @@ Fin."#,
             fx_stressed_exit_rate: None,
             effective_exit_spread_multiplier: 1.5,
             discrete_dividend_pv: 0.0,
+            projected_reference: 280.0,
+            projected_barrier: None,
+            financing_drag_pct: None,
+            barrier_touch_probability_pct: None,
+            monte_carlo_target_first_pct: Some(28.0),
+            monte_carlo_stop_first_pct: Some(18.0),
+            monte_carlo_ko_pct: Some(0.0),
+            monte_carlo_expected_return_pct: Some(2.1),
+            monte_carlo_p05_return_pct: Some(-25.0),
+            monte_carlo_p50_return_pct: Some(-3.0),
+            monte_carlo_p95_return_pct: Some(42.0),
             reasons: vec![],
             warnings: vec![],
         }

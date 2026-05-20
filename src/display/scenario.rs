@@ -453,7 +453,7 @@ fn draw_header(
 
     let block = Block::default()
         .title(Span::styled(
-            " Scenario warrants ",
+            " Scenario products ",
             Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
         ))
         .borders(Borders::ALL)
@@ -470,8 +470,9 @@ fn draw_table(
     decision_config: &DecisionConfig,
 ) {
     let header = Row::new([
-        "Dec", "Score", "Net@D", "P/L@D", "Str@D", "BE mv", "Tch<=D", "Spr", "Symb",
-        "Strike", "Maturite", "Par", "EntryAsk", "ExitBid@D", "IVout", "Delta", "DQ",
+        "Dec", "Score", "Net@D", "P/L@D", "Str@D", "BE mv", "Tch<=D", "KO%", "MCev",
+        "Spr", "Symb", "Type", "Strike", "Maturite", "Par", "EntryAsk", "ExitBid@D",
+        "IVout", "DQ",
     ])
     .style(
         Style::default()
@@ -496,18 +497,23 @@ fn draw_table(
             Cell::from(breakeven_move_cell(candidate, underlying.price))
                 .style(breakeven_move_style(candidate, underlying.price)),
             Cell::from(format_optional_plain_pct(candidate.probability_target_pct)),
+            Cell::from(format_optional_plain_pct(candidate.barrier_touch_probability_pct))
+                .style(optional_risk_style(candidate.barrier_touch_probability_pct)),
+            Cell::from(format_optional_signed_pct(candidate.monte_carlo_expected_return_pct))
+                .style(optional_return_style(candidate.monte_carlo_expected_return_pct)),
             Cell::from(format_optional_plain_pct(candidate.spread_pct)),
             Cell::from(candidate.symbol.clone()).style(Style::default().add_modifier(Modifier::BOLD)),
+            Cell::from(product_kind_label(candidate))
+                .style(product_kind_style(candidate)),
             Cell::from(format_contract_level(candidate.strike))
                 .style(Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
-            Cell::from(candidate.maturity.to_string())
+            Cell::from(candidate.maturity_label.clone())
                 .style(Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
             Cell::from(format_compact_float(candidate.parity))
                 .style(Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
             Cell::from(format!("{:.4}", candidate.entry_price)),
             Cell::from(format!("{:.4}", candidate.projected_bid_price)),
-            Cell::from(format!("{:.1}%", candidate.exit_volatility * 100.0)),
-            Cell::from(delta_transition_cell(candidate)),
+            Cell::from(exit_volatility_cell(candidate)),
             Cell::from(format!("{:.0}", candidate.data_quality_score))
                 .style(score_style(candidate.data_quality_score)),
         ])
@@ -521,15 +527,17 @@ fn draw_table(
         Constraint::Length(8),
         Constraint::Length(8),
         Constraint::Length(7),
+        Constraint::Length(6),
+        Constraint::Length(7),
         Constraint::Length(7),
         Constraint::Length(10),
+        Constraint::Length(8),
         Constraint::Length(10),
         Constraint::Length(11),
         Constraint::Length(6),
         Constraint::Length(8),
         Constraint::Length(8),
         Constraint::Length(7),
-        Constraint::Length(8),
         Constraint::Length(4),
     ];
 
@@ -592,7 +600,7 @@ fn draw_details(
                         config.target_price,
                         config.target_date,
                         candidate.strike,
-                        candidate.maturity
+                        candidate.maturity_label
                     )),
                 ]),
                 Line::from(vec![
@@ -611,33 +619,7 @@ fn draw_details(
                         candidate.fee_drag_pct
                     )),
                 ]),
-                Line::from(vec![
-                    Span::styled("Stress IV ", Style::default().fg(Color::Magenta)),
-                    Span::raw(format!(
-                        "vol dynamique {:+.2}pt -> IV sortie {:.2}%; shock extra {:+.2}pt: targetPx {} -> net {} ({}). FX stress: {}.",
-                        candidate.dynamic_volatility_shift_points,
-                        candidate.exit_volatility * 100.0,
-                        candidate.volatility_shock_points,
-                        candidate
-                            .stressed_projected_price
-                            .map(|value| format!("{value:.4}"))
-                            .unwrap_or_else(|| "-".to_string()),
-                        format_optional_signed_pct(candidate.stressed_net_return_pct),
-                        format_optional_money_from_pct(
-                            candidate.stressed_net_return_pct,
-                            decision_config.fee_order_notional,
-                        ),
-                        candidate
-                            .fx_stressed_net_return_pct
-                            .map(|value| format!(
-                                "fx {:.4} -> net {} ({})",
-                                candidate.fx_stressed_exit_rate.unwrap_or(candidate.fx_exit_rate),
-                                format_optional_signed_pct(Some(value)),
-                                format_money_from_pct(value, decision_config.fee_order_notional)
-                            ))
-                            .unwrap_or_else(|| "inactif".to_string())
-                    )),
-                ]),
+                stress_line(candidate, decision_config),
                 Line::from(vec![
                     Span::styled("Montant ", Style::default().fg(Color::Yellow)),
                     Span::raw(money_plan_sentence(candidate, underlying, config, decision_config, today)),
@@ -710,18 +692,15 @@ fn draw_details(
                 ]),
                 Line::from(vec![
                     Span::styled("Options ", Style::default().fg(Color::Yellow)),
-                    Span::raw(format!(
-                        "IV entree {}  IV sortie {:.2}%  thetaH {}  spread {}  spread sortie x{:.2} (base x{:.2})",
-                        format_optional_factor_pct(candidate.implied_volatility),
-                        candidate.exit_volatility * 100.0,
-                        candidate
-                            .theta_horizon_pct
-                            .map(|value| format!("{value:.4}%"))
-                            .unwrap_or_else(|| "-".to_string()),
-                        format_optional_plain_pct(candidate.spread_pct),
-                        candidate.effective_exit_spread_multiplier,
-                        config.exit_spread_multiplier
-                    )),
+                    Span::raw(options_sentence(candidate, config)),
+                ]),
+                Line::from(vec![
+                    Span::styled("Fin/KO ", Style::default().fg(Color::Yellow)),
+                    Span::raw(financing_and_barrier_sentence(candidate)),
+                ]),
+                Line::from(vec![
+                    Span::styled("Monte Carlo ", Style::default().fg(Color::Yellow)),
+                    Span::raw(monte_carlo_sentence(candidate)),
                 ]),
                 Line::from(vec![
                     Span::styled("FX ", Style::default().fg(Color::Yellow)),
@@ -770,17 +749,7 @@ fn draw_details(
                     Span::styled("Action ", Style::default().fg(Color::Yellow)),
                     Span::raw(status_message.to_string()),
                 ]),
-                Line::from(format!(
-                    "Calc exit@date: Black-Scholes({}, S_eff={:.4}, K={:.4}, T cible->maturite, IV_sortie={:.2}%, r={:.2}%, q={:.2}%) / parity {} * fx_sortie {:.4}, puis penalite bid/spread. Les frais ne sont pas dans ExitBid@D; ils sont dans Net@D/P/L@D.",
-                    candidate.side,
-                    (config.target_price - candidate.discrete_dividend_pv).max(0.01),
-                    candidate.strike,
-                    candidate.exit_volatility * 100.0,
-                    config.risk_free_rate * 100.0,
-                    config.dividend_yield * 100.0,
-                    format_compact_float(candidate.parity),
-                    candidate.fx_exit_rate
-                )),
+                Line::from(format_exit_formula(candidate, config)),
                 Line::from(format!(
                     "Calc return@date: ({:.4} - {:.4}) / {:.4} * 100 = {:+.2}% brut; net apres frais broker = {:+.2}%",
                     candidate.projected_bid_price,
@@ -1186,6 +1155,13 @@ fn scenario_price_at_level(
     volatility: f64,
     fx_rate: f64,
 ) -> Option<f64> {
+    if candidate.pricing_model != "warrant_intrinsic" {
+        let intrinsic = match kind {
+            OptionKind::Call => (level - candidate.strike).max(0.0),
+            OptionKind::Put => (candidate.strike - level).max(0.0),
+        };
+        return Some(intrinsic / candidate.parity * fx_rate);
+    }
     let price = black_scholes_price(BlackScholesInput {
         kind,
         spot: level,
@@ -1603,6 +1579,29 @@ fn side_label(side: &str) -> String {
     }
 }
 
+fn product_kind_label(candidate: &ScenarioCandidate) -> &'static str {
+    match (candidate.product_family.as_str(), candidate.pricing_model.as_str()) {
+        ("warrant", "warrant_intrinsic") => "Warrant",
+        ("turbo", "financing_level") => "Turbo",
+        ("mini_future", "financing_level") => "MiniF",
+        ("open_end_knock_out", "financing_level") => "KO-fin",
+        ("open_end_knock_out", "barrier_only") => "KO-bar",
+        ("certificate", _) => "Certif",
+        (_, "financing_level") => "Fin",
+        (_, "barrier_only") => "Barrier",
+        _ => "Autre",
+    }
+}
+
+fn product_kind_style(candidate: &ScenarioCandidate) -> Style {
+    match candidate.product_family.as_str() {
+        "warrant" => Style::default().fg(Color::Magenta).add_modifier(Modifier::BOLD),
+        "turbo" | "mini_future" => Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+        "open_end_knock_out" => Style::default().fg(Color::Blue).add_modifier(Modifier::BOLD),
+        _ => Style::default().fg(Color::DarkGray),
+    }
+}
+
 fn score_style(score: f64) -> Style {
     if score >= 80.0 {
         Style::default().fg(Color::Green)
@@ -1629,6 +1628,15 @@ fn optional_return_style(return_pct: Option<f64>) -> Style {
         .unwrap_or_else(|| Style::default().fg(Color::DarkGray))
 }
 
+fn optional_risk_style(risk_pct: Option<f64>) -> Style {
+    match risk_pct {
+        Some(value) if value >= 50.0 => Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+        Some(value) if value >= 25.0 => Style::default().fg(Color::Yellow),
+        Some(_) => Style::default().fg(Color::Green),
+        None => Style::default().fg(Color::DarkGray),
+    }
+}
+
 fn breakeven_move_cell(candidate: &ScenarioCandidate, spot: f64) -> String {
     candidate
         .breakeven_underlying
@@ -1650,12 +1658,16 @@ fn breakeven_move_style(candidate: &ScenarioCandidate, spot: f64) -> Style {
     }
 }
 
-fn delta_transition_cell(candidate: &ScenarioCandidate) -> String {
-    match (candidate.delta, candidate.target_delta) {
-        (Some(entry), Some(target)) => format!("{entry:.3}->{target:.3}"),
-        (Some(entry), None) => format!("{entry:.3}->-"),
-        _ => "-".to_string(),
+fn exit_volatility_cell(candidate: &ScenarioCandidate) -> String {
+    if is_linear_product(candidate) {
+        "linear".to_string()
+    } else {
+        format!("{:.1}%", candidate.exit_volatility * 100.0)
     }
+}
+
+fn is_linear_product(candidate: &ScenarioCandidate) -> bool {
+    candidate.pricing_model != "warrant_intrinsic"
 }
 
 fn breakeven_sentence(candidate: &ScenarioCandidate, spot: f64) -> String {
@@ -1665,7 +1677,7 @@ fn breakeven_sentence(candidate: &ScenarioCandidate, spot: f64) -> String {
     let move_pct = signed_move_pct(spot, level);
     let direction = if move_pct >= 0.0 { "monter" } else { "baisser" };
     format!(
-        "a la date cible, rentable a partir de {:.4}: le sous-jacent doit {} de {:.2}% depuis le spot (BE move {:+.2}%). Ce niveau inclut le temps restant jusqu'a maturite a la date cible, frais inclus, IV supposee stable.",
+        "a la date cible, P/L net nul a partir de {:.4}: le sous-jacent doit {} de {:.2}% depuis le spot (BE move {:+.2}%). Ce seuil inclut le temps restant jusqu'a maturite a la date cible, les frais, l'IV de sortie ajustee et le spread de sortie estime.",
         level,
         direction,
         move_pct.abs(),
@@ -1720,14 +1732,118 @@ fn money_plan_sentence(
 ) -> String {
     let notional = decision_config.fee_order_notional;
     let target = format_money_from_pct(candidate.net_return_pct, notional);
-    let stress = format_optional_money_from_pct(candidate.stressed_net_return_pct, notional);
+    let stress = if is_linear_product(candidate) {
+        "n/a".to_string()
+    } else {
+        format_optional_money_from_pct(candidate.stressed_net_return_pct, notional)
+    };
     let stop = build_payoff_chart(candidate, underlying, config, decision_config, today)
         .and_then(|data| data.stop_net_pct)
         .map(|stop_net| format_money_from_pct(stop_net, notional))
         .unwrap_or_else(|| "-".to_string());
     format!(
-        "pour {:.2} EUR engages: target {}, stress IV {}, stop {}. Le point mort est environ 0 EUR net apres frais.",
+        "pour {:.2} EUR engages: target {}, stress IV {}, stop {}. Au point mort, le P/L net estime est proche de 0 EUR apres frais.",
         notional, target, stress, stop
+    )
+}
+
+fn stress_line(candidate: &ScenarioCandidate, decision_config: &DecisionConfig) -> Line<'static> {
+    if is_linear_product(candidate) {
+        return Line::from(vec![
+            Span::styled("Stress IV ", Style::default().fg(Color::Magenta)),
+            Span::raw(format!(
+                "n/a pour produit lineaire {}; le calcul utilise intrinsic/parite/FX. Risques restants: financement futur, barriere, spread et FX.",
+                candidate.pricing_model
+            )),
+        ]);
+    }
+
+    Line::from(vec![
+        Span::styled("Stress IV ", Style::default().fg(Color::Magenta)),
+        Span::raw(format!(
+            "vol dynamique {:+.2}pt -> IV sortie {:.2}%; shock extra {:+.2}pt: targetPx {} -> net {} ({}). FX stress: {}.",
+            candidate.dynamic_volatility_shift_points,
+            candidate.exit_volatility * 100.0,
+            candidate.volatility_shock_points,
+            candidate
+                .stressed_projected_price
+                .map(|value| format!("{value:.4}"))
+                .unwrap_or_else(|| "-".to_string()),
+            format_optional_signed_pct(candidate.stressed_net_return_pct),
+            format_optional_money_from_pct(
+                candidate.stressed_net_return_pct,
+                decision_config.fee_order_notional,
+            ),
+            candidate
+                .fx_stressed_net_return_pct
+                .map(|value| format!(
+                    "fx {:.4} -> net {} ({})",
+                    candidate.fx_stressed_exit_rate.unwrap_or(candidate.fx_exit_rate),
+                    format_optional_signed_pct(Some(value)),
+                    format_money_from_pct(value, decision_config.fee_order_notional)
+                ))
+                .unwrap_or_else(|| "inactif".to_string())
+        )),
+    ])
+}
+
+fn options_sentence(candidate: &ScenarioCandidate, config: &ScenarioConfig) -> String {
+    if is_linear_product(candidate) {
+        return format!(
+            "IV n/a  thetaH 0.0000%  vega n/a  spread {}  spread sortie x{:.2}; produit lineaire, pas Black-Scholes.",
+            format_optional_plain_pct(candidate.spread_pct),
+            candidate.effective_exit_spread_multiplier
+        );
+    }
+
+    format!(
+        "IV entree {}  IV sortie {:.2}%  thetaH {}  spread {}  spread sortie x{:.2} (base x{:.2})",
+        format_optional_factor_pct(candidate.implied_volatility),
+        candidate.exit_volatility * 100.0,
+        candidate
+            .theta_horizon_pct
+            .map(|value| format!("{value:.4}%"))
+            .unwrap_or_else(|| "-".to_string()),
+        format_optional_plain_pct(candidate.spread_pct),
+        candidate.effective_exit_spread_multiplier,
+        config.exit_spread_multiplier
+    )
+}
+
+fn financing_and_barrier_sentence(candidate: &ScenarioCandidate) -> String {
+    if !is_linear_product(candidate) {
+        return format!(
+            "reference payoff {:.4}; barriere {}; KO% {}.",
+            candidate.projected_reference,
+            candidate
+                .projected_barrier
+                .map(|value| format!("{value:.4}"))
+                .unwrap_or_else(|| "-".to_string()),
+            format_optional_plain_pct(candidate.barrier_touch_probability_pct)
+        );
+    }
+    format!(
+        "reference projetee {:.4}; barriere projetee {}; cout financement vs reference actuelle {}; KO% {}.",
+        candidate.projected_reference,
+        candidate
+            .projected_barrier
+            .map(|value| format!("{value:.4}"))
+            .unwrap_or_else(|| "-".to_string()),
+        format_optional_signed_pct(candidate.financing_drag_pct),
+        format_optional_plain_pct(candidate.barrier_touch_probability_pct)
+    )
+}
+
+fn monte_carlo_sentence(candidate: &ScenarioCandidate) -> String {
+    format!(
+        "T avant S/KO {}  Stop avant T {}  KO {}  EV {}  P/L p05/p50/p95 {}/{}/{}",
+        format_optional_plain_pct(candidate.monte_carlo_target_first_pct),
+        format_optional_plain_pct(candidate.monte_carlo_stop_first_pct),
+        format_optional_plain_pct(candidate.monte_carlo_ko_pct),
+        format_optional_signed_pct(candidate.monte_carlo_expected_return_pct),
+        format_optional_signed_pct(candidate.monte_carlo_p05_return_pct),
+        format_optional_signed_pct(candidate.monte_carlo_p50_return_pct),
+        format_optional_signed_pct(candidate.monte_carlo_p95_return_pct)
     )
 }
 
@@ -1856,6 +1972,17 @@ fn human_reasons(reasons: &[String]) -> String {
             "scenario_return_below_buy_threshold" => "rendement net positif mais sous le seuil BUY scenario",
             "target_probability_too_low" => "probabilite d'atteindre la cible trop faible",
             "breakeven_probability_too_low" => "probabilite d'atteindre le breakeven trop faible",
+            "expected_value_negative" => "EV risk-neutral negative: le prix actuel n'offre pas d'avantage mathematique",
+            "monte_carlo_ev_negative" => {
+                "EV Monte Carlo negative: les trajectoires simulees ne compensent pas le risque"
+            }
+            "target_before_stop_not_favored" => {
+                "Monte Carlo defavorable: le stop/KO arrive au moins aussi souvent que le target"
+            }
+            "barrier_touch_probability_too_high" => "probabilite de toucher la barriere trop elevee",
+            "linear_financing_unmodeled_long_horizon" => {
+                "produit lineaire open-end sur horizon long: financement futur non modelise, BUY bloque"
+            }
             "volatility_crush_erases_return" => "stress de baisse d'IV efface le gain projete",
             "fx_stress_erases_return" => "stress FX efface le gain projete",
             _ => "raison non documentee",
@@ -1882,10 +2009,45 @@ fn human_warnings(warnings: &[String]) -> String {
             "opposite_side_scenario" => {
                 "side nominal oppose a la these, garde car le pricing projete reste analyse"
             }
+            "linear_product_projection" => {
+                "produit lineaire: projection par valeur intrinseque/parite/FX, pas Black-Scholes"
+            }
+            "open_end_no_expiry_model" => {
+                "open-end: pas d'echeance contractuelle, theta force a 0 dans le scenario"
+            }
+            "future_financing_not_projected" => {
+                "niveau de financement/barriere futur non projete: projection basee sur la reference actuelle"
+            }
+            "future_financing_projected" => {
+                "niveau de financement/barriere projete avec SCENARIO_LINEAR_FINANCING_RATE_PCT"
+            }
             _ => "warning non documente",
         })
         .collect::<Vec<_>>()
         .join(" | ")
+}
+
+fn format_exit_formula(candidate: &ScenarioCandidate, config: &ScenarioConfig) -> String {
+    if candidate.pricing_model == "warrant_intrinsic" {
+        return format!(
+            "Calc exit@date: Black-Scholes({}, S_eff={:.4}, K={:.4}, T cible->maturite, IV_sortie={:.2}%, r={:.2}%, q={:.2}%) / parity {} * fx_sortie {:.4}, puis penalite bid/spread. Les frais ne sont pas dans ExitBid@D; ils sont dans Net@D/P/L@D.",
+            candidate.side,
+            (config.target_price - candidate.discrete_dividend_pv).max(0.01),
+            candidate.strike,
+            candidate.exit_volatility * 100.0,
+            config.risk_free_rate * 100.0,
+            config.dividend_yield * 100.0,
+            format_compact_float(candidate.parity),
+            candidate.fx_exit_rate
+        );
+    }
+
+    format!(
+        "Calc exit@date: modele lineaire {}: intrinsic=max(direction*(S_eff-K),0) / parity {} * fx_sortie {:.4}, avec barriere si fournie, puis penalite bid/spread. Pas de theta/vega Black-Scholes pour ce produit.",
+        candidate.pricing_model,
+        format_compact_float(candidate.parity),
+        candidate.fx_exit_rate
+    )
 }
 
 #[cfg(test)]

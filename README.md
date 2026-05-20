@@ -12,9 +12,10 @@ Outil Rust/Docker pour decouvrir, parser et analyser des warrants, turbos et pro
 - Parsing strict des fiches Boursorama/Euronext: bid/ask, strike, maturite, parite, devise, emetteur, type de produit.
 - Nettoyage de donnees: rejet des prix non executables, ask/bid a zero, prix stale, spreads aberrants et incoherences de devise.
 - Analyse `opportunities`: detection de decorellations relatives entre produits comparables.
-- Mode `scenario`: recherche des meilleurs warrants pour une these humaine, par exemple "AAPL a 330 USD fin octobre 2026".
+- Mode `scenario`: recherche des meilleurs produits pour une these humaine, par exemple "AAPL a 330 USD fin octobre 2026".
 - En mode `SCENARIO_SIDE=auto`, les calls et les puts sont tous recalcules: un produit nominalement oppose a la these peut donc apparaitre si son prix projete devient interessant via IV, theta ou convexite.
-- Pricing Black-Scholes, IV, greeks, theta, stress de volatilite, stress FX, dividendes discrets et penalite de spread de sortie.
+- Pricing Black-Scholes pour warrants vanilla; projection lineaire intrinsic/parite/FX pour turbos, mini-futures et knock-out compatibles.
+- IV, greeks, theta, stress de volatilite, stress FX, dividendes discrets et penalite de spread de sortie quand le modele du produit le permet.
 - Caches locaux pour les bougies et les audits LLM afin d'eviter de consommer trop de credits API.
 - Interface terminal Ratatui avec tableau, notes, droite de decision et onglet Gemini.
 
@@ -118,10 +119,13 @@ Les colonnes principales:
 - `Str@D`: rendement net a la date cible avec stress de volatilite implicite.
 - `BE mv`: mouvement minimum du sous-jacent pour atteindre le point mort.
 - `Tch<=D`: probabilite first-touch d'atteindre la cible avant ou a la date scenario.
+- `KO%`: probabilite first-touch de barriere/knock-out avant la date cible, si barriere connue.
+- `MCev`: esperance de rendement issue de la simulation Monte Carlo target/stop/KO.
 - `Spr`: spread courant.
+- `Type`: famille du produit (`Warrant`, `Turbo`, `MiniF`, `KO-fin`, `KO-bar`).
 - `EntryAsk`: prix d'entree acheteur utilise.
 - `ExitBid@D`: prix de sortie bid estime a la date cible, hors frais broker.
-- `IVout`: volatilite utilisee a la sortie apres ajustement dynamique.
+- `IVout`: volatilite utilisee a la sortie pour warrants vanilla; `linear` pour turbos/mini-futures/KO ou l'IV n'est pas utilisee.
 - `DQ`: qualite des donnees.
 
 La droite de decision place les niveaux importants sur un seul axe de mouvement du sous-jacent:
@@ -148,9 +152,14 @@ MARKET_DATA_REFRESH=cache
 SCENARIO_SIDE=auto
 SCENARIO_MIN_BUY_RETURN_PCT=8
 SCENARIO_MIN_BUY_SCORE=70
+SCENARIO_MAX_UNMODELED_LINEAR_BUY_DAYS=45
 SCENARIO_VOL_SHOCK_POINTS=-5
 SCENARIO_VOL_SPOT_SLOPE_POINTS_PER_PCT=-0.50
 SCENARIO_EXIT_SPREAD_MULTIPLIER=1.5
+SCENARIO_LINEAR_FINANCING_RATE_PCT=0
+SCENARIO_MAX_BUY_KO_PROB_PCT=30
+SCENARIO_MC_PATHS=512
+SCENARIO_MC_MAX_STEPS=128
 
 LLM_ENABLE=1
 GEMINI_API_KEY=gemini_key_1,gemini_key_2
@@ -174,9 +183,14 @@ Le moteur combine des calculs deterministes et des heuristiques:
 
 - Black-Scholes pour les warrants vanille
 - valeur intrinseque/parite pour les produits a financement
+- mode lineaire sans theta/vega artificiels pour turbos, mini-futures et open-end knock-out
 - conversion FX lorsque le sous-jacent et le produit ne sont pas dans la meme devise
 - nettoyage strict des prix executables
 - frais broker, spread actuel et spread estime a la sortie
 - stress de volatilite implicite et de change
+- probabilite de knock-out/barriere avant la date cible
+- simulation Monte Carlo GBM pour `target avant stop`, `stop avant target`, KO, EV et percentiles P/L
+
+Pour les produits lineaires open-end (`MiniF`, `Turbo`, `KO-fin`), la projection peut utiliser un financement futur si `SCENARIO_LINEAR_FINANCING_RATE_PCT` est renseigne. Sans ce taux, le moteur utilise le niveau de financement/barriere actuel. Si l'horizon depasse `SCENARIO_MAX_UNMODELED_LINEAR_BUY_DAYS`, le produit reste visible mais ne peut plus etre classe `BUY`: il passe au minimum en `WATCH`, car le financement futur n'est pas encore modele explicitement.
 
 Le module Gemini est un auditeur qualitatif. Il ne remplace pas le moteur quantitatif et ne doit pas etre utilise comme conseil financier.

@@ -24,6 +24,9 @@ pub struct ScenarioConfig {
     pub vol_spot_slope_points_per_pct: f64,
     pub exit_spread_multiplier: f64,
     pub exit_spread_delta_penalty: f64,
+    pub linear_financing_rate: f64,
+    pub monte_carlo_paths: usize,
+    pub monte_carlo_max_steps: usize,
     pub stale_pricing_guard: bool,
     pub paris_hour: Option<u32>,
     pub dividends: Vec<DiscreteDividend>,
@@ -41,10 +44,13 @@ pub struct ScenarioCandidate {
     pub score: f64,
     pub symbol: String,
     pub side: String,
+    pub product_family: String,
+    pub pricing_model: String,
     pub product_type: String,
     pub url: String,
     pub strike: f64,
     pub maturity: NaiveDate,
+    pub maturity_label: String,
     pub entry_price: f64,
     pub projected_price: f64,
     pub projected_bid_price: f64,
@@ -92,6 +98,17 @@ pub struct ScenarioCandidate {
     pub fx_stressed_exit_rate: Option<f64>,
     pub effective_exit_spread_multiplier: f64,
     pub discrete_dividend_pv: f64,
+    pub projected_reference: f64,
+    pub projected_barrier: Option<f64>,
+    pub financing_drag_pct: Option<f64>,
+    pub barrier_touch_probability_pct: Option<f64>,
+    pub monte_carlo_target_first_pct: Option<f64>,
+    pub monte_carlo_stop_first_pct: Option<f64>,
+    pub monte_carlo_ko_pct: Option<f64>,
+    pub monte_carlo_expected_return_pct: Option<f64>,
+    pub monte_carlo_p05_return_pct: Option<f64>,
+    pub monte_carlo_p50_return_pct: Option<f64>,
+    pub monte_carlo_p95_return_pct: Option<f64>,
     pub reasons: Vec<String>,
     pub warnings: Vec<String>,
 }
@@ -103,6 +120,8 @@ struct ScenarioDecisionThresholds {
     min_buy_probability_target_pct: f64,
     min_buy_probability_breakeven_pct: f64,
     score_return_target_pct: f64,
+    max_unmodeled_linear_buy_days: i64,
+    max_buy_ko_probability_pct: f64,
 }
 
 impl Default for ScenarioDecisionThresholds {
@@ -113,6 +132,8 @@ impl Default for ScenarioDecisionThresholds {
             min_buy_probability_target_pct: 10.0,
             min_buy_probability_breakeven_pct: 20.0,
             score_return_target_pct: 20.0,
+            max_unmodeled_linear_buy_days: 45,
+            max_buy_ko_probability_pct: 30.0,
         }
     }
 }
@@ -132,6 +153,12 @@ impl ScenarioDecisionThresholds {
             score_return_target_pct: read_env_f64("SCENARIO_SCORE_RETURN_TARGET_PCT")
                 .unwrap_or(default.score_return_target_pct)
                 .max(0.01),
+            max_unmodeled_linear_buy_days: read_env_i64("SCENARIO_MAX_UNMODELED_LINEAR_BUY_DAYS")
+                .unwrap_or(default.max_unmodeled_linear_buy_days)
+                .max(0),
+            max_buy_ko_probability_pct: read_env_f64("SCENARIO_MAX_BUY_KO_PROB_PCT")
+                .unwrap_or(default.max_buy_ko_probability_pct)
+                .clamp(0.0, 100.0),
         }
     }
 }
@@ -175,18 +202,21 @@ fn analyze_signal(
     decision_config: &DecisionConfig,
     today: NaiveDate,
 ) -> Option<ScenarioCandidate> {
-    if signal.product_family != "warrant" || signal.pricing_model != "warrant_intrinsic" {
+    if !is_supported_scenario_model(signal) {
         return None;
     }
     if !scenario_side_accepts(&config.side, &signal.side) {
         return None;
     }
-    let maturity = parse_date(&signal.maturity)?;
-    if maturity <= config.target_date {
+    let scenario_maturity = scenario_maturity(signal, config)?;
+    let maturity = scenario_maturity.date;
+    if !scenario_maturity.is_open_end && maturity <= config.target_date {
         return None;
     }
-    let maturity_before_preferred_window = config.min_maturity.is_some_and(|min| maturity < min);
-    let maturity_after_preferred_window = config.max_maturity.is_some_and(|max| maturity > max);
+    let maturity_before_preferred_window =
+        !scenario_maturity.is_open_end && config.min_maturity.is_some_and(|min| maturity < min);
+    let maturity_after_preferred_window =
+        !scenario_maturity.is_open_end && config.max_maturity.is_some_and(|max| maturity > max);
     let entry_price = signal
         .ask_price
         .filter(|value| *value > 0.0)
@@ -229,28 +259,32 @@ fn analyze_signal(
         &config.dividends,
     );
     let pricing_target = (config.target_price - discrete_dividend_pv).max(0.01);
-    let raw_target_delta = raw_delta(
+    let raw_target_delta = raw_delta_for_model(
+        signal,
         kind,
         pricing_target,
-        signal.strike,
         years_remaining,
         config.risk_free_rate,
         0.0,
         exit_volatility,
+        parity,
+        fx_exit_rate,
     )
     .unwrap_or(0.5);
     let effective_exit_spread_multiplier =
         dynamic_exit_spread_multiplier(config, raw_target_delta.abs());
     let projected_price = scenario_product_price(
+        signal,
         kind,
         pricing_target,
-        signal.strike,
         years_remaining,
+        years_to_target,
         config.risk_free_rate,
         scenario_dividend_yield(config),
         exit_volatility,
         parity,
         fx_exit_rate,
+        config,
     )?;
     if projected_price <= 0.0 {
         return None;
@@ -260,28 +294,32 @@ fn analyze_signal(
     let stressed_volatility =
         (exit_volatility + config.volatility_shock_points / 100.0).clamp(0.0001, 5.0);
     let stressed_projected_price = scenario_product_price(
+        signal,
         kind,
         pricing_target,
-        signal.strike,
         years_remaining,
+        years_to_target,
         config.risk_free_rate,
         scenario_dividend_yield(config),
         stressed_volatility,
         parity,
         fx_exit_rate,
+        config,
     )
     .map(|price| apply_exit_spread_penalty(price, signal.spread_pct, effective_exit_spread_multiplier));
     let fx_stressed_projected_price = fx_stressed_exit_rate.and_then(|fx_rate| {
         scenario_product_price(
+            signal,
             kind,
             pricing_target,
-            signal.strike,
             years_remaining,
+            years_to_target,
             config.risk_free_rate,
             scenario_dividend_yield(config),
             stressed_volatility,
             parity,
             fx_rate,
+            config,
         )
         .map(|price| apply_exit_spread_penalty(price, signal.spread_pct, effective_exit_spread_multiplier))
     });
@@ -326,8 +364,15 @@ fn analyze_signal(
         )
         .map(|result| result.net_return_pct)
     });
-    let breakeven_underlying =
-        solve_breakeven_underlying(kind, signal, years_remaining, exit_volatility, config, decision_config);
+    let breakeven_underlying = solve_breakeven_underlying(
+        kind,
+        signal,
+        years_remaining,
+        years_to_target,
+        exit_volatility,
+        config,
+        decision_config,
+    );
     let scenario_direction = direction_for_level(spot, config.target_price)?;
     let breakeven_distance_pct =
         breakeven_underlying.map(|value| signed_move_pct(spot, value));
@@ -353,9 +398,9 @@ fn analyze_signal(
         volatility,
     );
     let risk_neutral_ev_pct = risk_neutral_expected_value_pct(
+        signal,
         kind,
         spot,
-        signal.strike,
         years_to_maturity,
         years_to_target,
         config.risk_free_rate,
@@ -365,6 +410,54 @@ fn analyze_signal(
         signal.fx_rate,
         entry_price,
         decision_config,
+        config,
+    );
+    let projected_reference = projected_linear_reference(
+        kind,
+        signal.strike,
+        years_to_target,
+        signal.maturity == "open-end",
+        config.linear_financing_rate,
+    );
+    let projected_barrier = signal.barrier.map(|barrier| {
+        projected_linear_reference(
+            kind,
+            barrier,
+            years_to_target,
+            signal.maturity == "open-end",
+            config.linear_financing_rate,
+        )
+    });
+    let no_financing_projected_price = if is_linear_model(signal) {
+        linear_product_price(kind, pricing_target, signal.strike, signal.barrier, parity, fx_exit_rate)
+            .map(|price| apply_exit_spread_penalty(price, signal.spread_pct, effective_exit_spread_multiplier))
+    } else {
+        None
+    };
+    let financing_drag_pct = no_financing_projected_price
+        .filter(|price| *price > 0.0)
+        .map(|price| (projected_bid_price - price) / price * 100.0);
+    let barrier_touch_probability_pct = barrier_touch_probability(
+        kind,
+        spot,
+        signal.barrier,
+        years_to_target,
+        config.real_world_drift,
+        volatility,
+    );
+    let monte_carlo = monte_carlo_scenario(
+        signal,
+        kind,
+        spot,
+        config,
+        decision_config,
+        today,
+        maturity,
+        entry_price,
+        parity,
+        volatility,
+        fx_exit_rate,
+        effective_exit_spread_multiplier,
     );
     let binary_stats = binary_scenario_stats(
         probability.probability_target_pct,
@@ -372,9 +465,9 @@ fn analyze_signal(
         -decision_config.max_loss_pct_per_trade.abs(),
     );
     let greeks = scenario_greeks(
+        signal,
         kind,
         spot,
-        signal.strike,
         years_to_maturity,
         config.risk_free_rate,
         config.dividend_yield,
@@ -383,9 +476,9 @@ fn analyze_signal(
         signal.fx_rate,
     );
     let target_greeks = scenario_greeks(
+        signal,
         kind,
         pricing_target,
-        signal.strike,
         years_remaining,
         config.risk_free_rate,
         scenario_dividend_yield(config),
@@ -396,6 +489,8 @@ fn analyze_signal(
 
     let mut reasons = Vec::new();
     let mut warnings = scenario_data_warnings(signal, config);
+    let is_linear_product = signal.pricing_model != "warrant_intrinsic";
+    let days_to_target = (config.target_date - today).num_days().max(0);
     if signal.execution_status != "executable_bid_ask" || signal.ask_price.is_none() {
         reasons.push("entry_price_not_executable".to_string());
     }
@@ -434,11 +529,40 @@ fn analyze_signal(
     }) {
         reasons.push("breakeven_probability_too_low".to_string());
     }
+    if barrier_touch_probability_pct.is_some_and(|probability| {
+        probability > thresholds.max_buy_ko_probability_pct
+    }) {
+        reasons.push("barrier_touch_probability_too_high".to_string());
+    }
+    if monte_carlo
+        .as_ref()
+        .and_then(|stats| stats.expected_return_pct)
+        .is_some_and(|value| value < 0.0)
+    {
+        reasons.push("monte_carlo_ev_negative".to_string());
+    }
+    if monte_carlo.as_ref().is_some_and(|stats| {
+        stats.target_first_pct
+            .zip(stats.stop_first_pct)
+            .is_some_and(|(target, stop)| target <= stop)
+    }) {
+        reasons.push("target_before_stop_not_favored".to_string());
+    }
     if stressed_net_return_pct.is_some_and(|value| value <= 0.0) {
         reasons.push("volatility_crush_erases_return".to_string());
     }
     if fx_stressed_net_return_pct.is_some_and(|value| value <= 0.0) {
         reasons.push("fx_stress_erases_return".to_string());
+    }
+    if risk_neutral_ev_pct.is_some_and(|value| value < 0.0) {
+        reasons.push("expected_value_negative".to_string());
+    }
+    if is_linear_product
+        && scenario_maturity.is_open_end
+        && days_to_target > thresholds.max_unmodeled_linear_buy_days
+        && config.linear_financing_rate <= 0.0
+    {
+        reasons.push("linear_financing_unmodeled_long_horizon".to_string());
     }
     if discrete_dividend_pv > 0.0 {
         warnings.push("discrete_dividends_applied".to_string());
@@ -448,6 +572,17 @@ fn analyze_signal(
     }
     if option_kind(&config.side).is_none() && kind != scenario_direction {
         warnings.push("opposite_side_scenario".to_string());
+    }
+    if is_linear_product {
+        warnings.push("linear_product_projection".to_string());
+        if config.linear_financing_rate > 0.0 && scenario_maturity.is_open_end {
+            warnings.push("future_financing_projected".to_string());
+        } else {
+            warnings.push("future_financing_not_projected".to_string());
+        }
+    }
+    if scenario_maturity.is_open_end {
+        warnings.push("open_end_no_expiry_model".to_string());
     }
 
     let score = scenario_score(
@@ -465,10 +600,13 @@ fn analyze_signal(
         score,
         symbol: signal.symbol.clone(),
         side: signal.side.clone(),
+        product_family: signal.product_family.clone(),
+        pricing_model: signal.pricing_model.clone(),
         product_type: signal.product_type.clone(),
         url: signal.web_url.clone(),
         strike: signal.strike,
         maturity,
+        maturity_label: scenario_maturity.label,
         entry_price,
         projected_price,
         projected_bid_price,
@@ -516,32 +654,115 @@ fn analyze_signal(
         fx_stressed_exit_rate,
         effective_exit_spread_multiplier,
         discrete_dividend_pv,
+        projected_reference,
+        projected_barrier,
+        financing_drag_pct,
+        barrier_touch_probability_pct,
+        monte_carlo_target_first_pct: monte_carlo.as_ref().and_then(|stats| stats.target_first_pct),
+        monte_carlo_stop_first_pct: monte_carlo.as_ref().and_then(|stats| stats.stop_first_pct),
+        monte_carlo_ko_pct: monte_carlo.as_ref().and_then(|stats| stats.ko_pct),
+        monte_carlo_expected_return_pct: monte_carlo
+            .as_ref()
+            .and_then(|stats| stats.expected_return_pct),
+        monte_carlo_p05_return_pct: monte_carlo.as_ref().and_then(|stats| stats.p05_return_pct),
+        monte_carlo_p50_return_pct: monte_carlo.as_ref().and_then(|stats| stats.p50_return_pct),
+        monte_carlo_p95_return_pct: monte_carlo.as_ref().and_then(|stats| stats.p95_return_pct),
         reasons,
         warnings,
     })
 }
 
 fn scenario_product_price(
+    signal: &OpportunitySignal,
     kind: OptionKind,
     target_price: f64,
-    strike: f64,
     years_remaining: f64,
+    years_from_now: f64,
     risk_free_rate: f64,
     dividend_yield: f64,
     volatility: f64,
     parity: f64,
     fx_rate: f64,
+    config: &ScenarioConfig,
 ) -> Option<f64> {
+    if is_linear_model(signal) {
+        let reference = projected_linear_reference(
+            kind,
+            signal.strike,
+            years_from_now,
+            signal.maturity == "open-end",
+            config.linear_financing_rate,
+        );
+        let barrier = signal.barrier.map(|barrier| {
+            projected_linear_reference(
+                kind,
+                barrier,
+                years_from_now,
+                signal.maturity == "open-end",
+                config.linear_financing_rate,
+            )
+        });
+        return linear_product_price(kind, target_price, reference, barrier, parity, fx_rate);
+    }
     let price_per_underlying = black_scholes_price(BlackScholesInput {
         kind,
         spot: target_price,
-        strike,
+        strike: signal.strike,
         years_to_maturity: years_remaining,
         risk_free_rate,
         dividend_yield,
         volatility,
     })?;
     Some(price_per_underlying / parity * fx_rate)
+}
+
+fn is_linear_model(signal: &OpportunitySignal) -> bool {
+    signal.pricing_model != "warrant_intrinsic"
+}
+
+fn projected_linear_reference(
+    kind: OptionKind,
+    reference: f64,
+    years_from_now: f64,
+    is_open_end: bool,
+    annual_financing_rate: f64,
+) -> f64 {
+    if !is_open_end || annual_financing_rate <= 0.0 || years_from_now <= 0.0 {
+        return reference;
+    }
+    let exponent = annual_financing_rate * years_from_now;
+    match kind {
+        OptionKind::Call => reference * exponent.exp(),
+        OptionKind::Put => reference * (-exponent).exp(),
+    }
+}
+
+fn linear_product_price(
+    kind: OptionKind,
+    target_price: f64,
+    strike: f64,
+    barrier: Option<f64>,
+    parity: f64,
+    fx_rate: f64,
+) -> Option<f64> {
+    if parity <= 0.0 || fx_rate <= 0.0 {
+        return None;
+    }
+    if barrier.is_some_and(|barrier| barrier_crossed(kind, target_price, barrier)) {
+        return Some(0.0);
+    }
+    let intrinsic = match kind {
+        OptionKind::Call => (target_price - strike).max(0.0),
+        OptionKind::Put => (strike - target_price).max(0.0),
+    };
+    Some(intrinsic / parity * fx_rate)
+}
+
+fn barrier_crossed(kind: OptionKind, target_price: f64, barrier: f64) -> bool {
+    match kind {
+        OptionKind::Call => target_price <= barrier,
+        OptionKind::Put => target_price >= barrier,
+    }
 }
 
 fn apply_exit_spread_penalty(price: f64, spread_pct: Option<f64>, multiplier: f64) -> f64 {
@@ -606,6 +827,53 @@ fn raw_delta(
         volatility,
     })
     .map(|greeks| greeks.delta)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn raw_delta_for_model(
+    signal: &OpportunitySignal,
+    kind: OptionKind,
+    spot: f64,
+    years_to_maturity: f64,
+    risk_free_rate: f64,
+    dividend_yield: f64,
+    volatility: f64,
+    parity: f64,
+    fx_rate: f64,
+) -> Option<f64> {
+    if signal.pricing_model == "warrant_intrinsic" {
+        return raw_delta(
+            kind,
+            spot,
+            signal.strike,
+            years_to_maturity,
+            risk_free_rate,
+            dividend_yield,
+            volatility,
+        );
+    }
+    linear_delta(kind, spot, signal.strike, signal.barrier, parity, fx_rate)
+}
+
+fn linear_delta(
+    kind: OptionKind,
+    spot: f64,
+    strike: f64,
+    barrier: Option<f64>,
+    parity: f64,
+    fx_rate: f64,
+) -> Option<f64> {
+    if parity <= 0.0 || fx_rate <= 0.0 {
+        return None;
+    }
+    if barrier.is_some_and(|barrier| barrier_crossed(kind, spot, barrier)) {
+        return Some(0.0);
+    }
+    match kind {
+        OptionKind::Call if spot > strike => Some(fx_rate / parity),
+        OptionKind::Put if spot < strike => Some(-fx_rate / parity),
+        _ => Some(0.0),
+    }
 }
 
 fn scenario_data_warnings(signal: &OpportunitySignal, config: &ScenarioConfig) -> Vec<String> {
@@ -680,11 +948,314 @@ fn scenario_probabilities(
     }
 }
 
-#[allow(clippy::too_many_arguments)]
-fn risk_neutral_expected_value_pct(
+fn barrier_touch_probability(
     kind: OptionKind,
     spot: f64,
-    strike: f64,
+    barrier: Option<f64>,
+    years_to_target: f64,
+    real_world_drift: f64,
+    volatility: f64,
+) -> Option<f64> {
+    let barrier = barrier?;
+    let direction = match kind {
+        OptionKind::Call => OptionKind::Put,
+        OptionKind::Put => OptionKind::Call,
+    };
+    first_touch_probability(
+        direction,
+        spot,
+        barrier,
+        years_to_target,
+        real_world_drift,
+        volatility,
+    )
+    .map(|probability| probability * 100.0)
+}
+
+#[derive(Debug, Clone, Default)]
+struct MonteCarloStats {
+    target_first_pct: Option<f64>,
+    stop_first_pct: Option<f64>,
+    ko_pct: Option<f64>,
+    expected_return_pct: Option<f64>,
+    p05_return_pct: Option<f64>,
+    p50_return_pct: Option<f64>,
+    p95_return_pct: Option<f64>,
+}
+
+#[allow(clippy::too_many_arguments)]
+fn monte_carlo_scenario(
+    signal: &OpportunitySignal,
+    kind: OptionKind,
+    spot: f64,
+    config: &ScenarioConfig,
+    decision_config: &DecisionConfig,
+    today: NaiveDate,
+    maturity: NaiveDate,
+    entry_price: f64,
+    parity: f64,
+    volatility: f64,
+    fx_exit_rate: f64,
+    exit_spread_multiplier: f64,
+) -> Option<MonteCarloStats> {
+    if config.monte_carlo_paths == 0 || config.monte_carlo_max_steps == 0 {
+        return None;
+    }
+    let years_to_target = years_between(today, config.target_date)?;
+    let years_to_maturity = years_between(today, maturity)?;
+    if spot <= 0.0 || entry_price <= 0.0 || volatility <= 0.0 || years_to_maturity <= 0.0 {
+        return None;
+    }
+
+    let days_to_target = (config.target_date - today).num_days().max(1) as usize;
+    let steps = days_to_target.min(config.monte_carlo_max_steps.max(1));
+    let dt = years_to_target / steps as f64;
+    let drift = config.real_world_drift - 0.5 * volatility.powi(2);
+    let diffusion = volatility * dt.sqrt();
+    let target_direction = direction_for_level(spot, config.target_price)?;
+    let stop_loss_pct = -decision_config.max_loss_pct_per_trade.abs();
+    let mut rng = DeterministicRng::new(monte_carlo_seed(&signal.symbol, spot, config.target_price));
+    let mut returns = Vec::with_capacity(config.monte_carlo_paths);
+    let mut target_first = 0usize;
+    let mut stop_first = 0usize;
+    let mut ko_first = 0usize;
+
+    for _ in 0..config.monte_carlo_paths {
+        let mut level = spot;
+        let mut outcome = None::<(ScenarioPathOutcome, f64)>;
+
+        for step in 1..=steps {
+            let z = rng.standard_normal();
+            level *= (drift * dt + diffusion * z).exp();
+            let elapsed_years = dt * step as f64;
+            let remaining_to_maturity = (years_to_maturity - elapsed_years).max(1.0 / 3650.0);
+
+            if barrier_path_crossed(kind, level, projected_barrier_at_step(signal, kind, elapsed_years, config)) {
+                outcome = Some((ScenarioPathOutcome::KnockOut, -100.0));
+                break;
+            }
+
+            if target_reaches_breakeven(target_direction, level, config.target_price) {
+                let net = scenario_path_net_return(
+                    signal,
+                    kind,
+                    level,
+                    elapsed_years,
+                    remaining_to_maturity,
+                    entry_price,
+                    parity,
+                    volatility,
+                    fx_exit_rate,
+                    exit_spread_multiplier,
+                    config,
+                    decision_config,
+                )?;
+                outcome = Some((ScenarioPathOutcome::Target, net));
+                break;
+            }
+
+            let mark_to_market = scenario_path_net_return(
+                signal,
+                kind,
+                level,
+                elapsed_years,
+                remaining_to_maturity,
+                entry_price,
+                parity,
+                volatility,
+                fx_exit_rate,
+                exit_spread_multiplier,
+                config,
+                decision_config,
+            )?;
+            if mark_to_market <= stop_loss_pct {
+                outcome = Some((ScenarioPathOutcome::Stop, mark_to_market));
+                break;
+            }
+        }
+
+        let (path_outcome, path_return) = match outcome {
+            Some(value) => value,
+            None => {
+                let net = scenario_path_net_return(
+                    signal,
+                    kind,
+                    level,
+                    years_to_target,
+                    (years_to_maturity - years_to_target).max(1.0 / 3650.0),
+                    entry_price,
+                    parity,
+                    volatility,
+                    fx_exit_rate,
+                    exit_spread_multiplier,
+                    config,
+                    decision_config,
+                )?;
+                (ScenarioPathOutcome::Horizon, net)
+            }
+        };
+
+        match path_outcome {
+            ScenarioPathOutcome::Target => target_first += 1,
+            ScenarioPathOutcome::Stop => stop_first += 1,
+            ScenarioPathOutcome::KnockOut => ko_first += 1,
+            ScenarioPathOutcome::Horizon => {}
+        }
+        returns.push(path_return);
+    }
+
+    if returns.is_empty() {
+        return None;
+    }
+    returns.sort_by(|left, right| left.total_cmp(right));
+    let paths = returns.len() as f64;
+    let expected = returns.iter().sum::<f64>() / paths;
+    Some(MonteCarloStats {
+        target_first_pct: Some(target_first as f64 / paths * 100.0),
+        stop_first_pct: Some(stop_first as f64 / paths * 100.0),
+        ko_pct: Some(ko_first as f64 / paths * 100.0),
+        expected_return_pct: Some(expected),
+        p05_return_pct: Some(percentile_sorted(&returns, 0.05)),
+        p50_return_pct: Some(percentile_sorted(&returns, 0.50)),
+        p95_return_pct: Some(percentile_sorted(&returns, 0.95)),
+    })
+}
+
+#[derive(Debug, Clone, Copy)]
+enum ScenarioPathOutcome {
+    Target,
+    Stop,
+    KnockOut,
+    Horizon,
+}
+
+#[allow(clippy::too_many_arguments)]
+fn scenario_path_net_return(
+    signal: &OpportunitySignal,
+    kind: OptionKind,
+    level: f64,
+    elapsed_years: f64,
+    remaining_to_maturity: f64,
+    entry_price: f64,
+    parity: f64,
+    volatility: f64,
+    fx_rate: f64,
+    exit_spread_multiplier: f64,
+    config: &ScenarioConfig,
+    decision_config: &DecisionConfig,
+) -> Option<f64> {
+    let price = scenario_product_price(
+        signal,
+        kind,
+        level,
+        remaining_to_maturity,
+        elapsed_years,
+        config.risk_free_rate,
+        scenario_dividend_yield(config),
+        volatility,
+        parity,
+        fx_rate,
+        config,
+    )?;
+    let bid_price = apply_exit_spread_penalty(price, signal.spread_pct, exit_spread_multiplier);
+    net_return_after_fees(
+        entry_price,
+        bid_price,
+        decision_config.fee_order_notional,
+        decision_config.fee_buy_fixed,
+        decision_config.fee_buy_pct,
+        decision_config.fee_sell_fixed,
+        decision_config.fee_sell_pct,
+        decision_config.fee_deposit_fixed,
+        decision_config.fee_deposit_pct,
+    )
+    .map(|result| result.net_return_pct)
+}
+
+fn projected_barrier_at_step(
+    signal: &OpportunitySignal,
+    kind: OptionKind,
+    elapsed_years: f64,
+    config: &ScenarioConfig,
+) -> Option<f64> {
+    signal.barrier.map(|barrier| {
+        projected_linear_reference(
+            kind,
+            barrier,
+            elapsed_years,
+            signal.maturity == "open-end",
+            config.linear_financing_rate,
+        )
+    })
+}
+
+fn barrier_path_crossed(kind: OptionKind, level: f64, barrier: Option<f64>) -> bool {
+    barrier.is_some_and(|barrier| barrier_crossed(kind, level, barrier))
+}
+
+fn percentile_sorted(values: &[f64], percentile: f64) -> f64 {
+    if values.is_empty() {
+        return 0.0;
+    }
+    let index = ((values.len() - 1) as f64 * percentile.clamp(0.0, 1.0)).round() as usize;
+    values[index]
+}
+
+fn monte_carlo_seed(symbol: &str, spot: f64, target: f64) -> u64 {
+    let mut seed = 0xcbf29ce484222325u64;
+    for byte in symbol.as_bytes() {
+        seed ^= *byte as u64;
+        seed = seed.wrapping_mul(0x100000001b3);
+    }
+    seed ^= spot.to_bits();
+    seed = seed.wrapping_mul(0x100000001b3);
+    seed ^ target.to_bits()
+}
+
+struct DeterministicRng {
+    state: u64,
+    cached_normal: Option<f64>,
+}
+
+impl DeterministicRng {
+    fn new(seed: u64) -> Self {
+        Self {
+            state: seed.max(1),
+            cached_normal: None,
+        }
+    }
+
+    fn next_u64(&mut self) -> u64 {
+        self.state = self
+            .state
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        self.state
+    }
+
+    fn next_unit(&mut self) -> f64 {
+        let value = self.next_u64() >> 11;
+        ((value as f64) * (1.0 / ((1u64 << 53) as f64))).clamp(1e-12, 1.0 - 1e-12)
+    }
+
+    fn standard_normal(&mut self) -> f64 {
+        if let Some(value) = self.cached_normal.take() {
+            return value;
+        }
+        let u1 = self.next_unit();
+        let u2 = self.next_unit();
+        let radius = (-2.0 * u1.ln()).sqrt();
+        let angle = std::f64::consts::TAU * u2;
+        self.cached_normal = Some(radius * angle.sin());
+        radius * angle.cos()
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn risk_neutral_expected_value_pct(
+    signal: &OpportunitySignal,
+    kind: OptionKind,
+    spot: f64,
     years_to_maturity: f64,
     years_to_target: f64,
     risk_free_rate: f64,
@@ -694,17 +1265,20 @@ fn risk_neutral_expected_value_pct(
     fx_rate: f64,
     entry_price: f64,
     decision_config: &DecisionConfig,
+    config: &ScenarioConfig,
 ) -> Option<f64> {
     let fair_now = scenario_product_price(
+        signal,
         kind,
         spot,
-        strike,
         years_to_maturity,
+        0.0,
         risk_free_rate,
         dividend_yield,
         volatility,
         parity,
         fx_rate,
+        config,
     )?;
     let expected_exit_price = fair_now * (risk_free_rate * years_to_target).exp();
     net_return_after_fees(
@@ -758,9 +1332,9 @@ fn binary_scenario_stats(
 
 #[allow(clippy::too_many_arguments)]
 fn scenario_greeks(
+    signal: &OpportunitySignal,
     kind: OptionKind,
     spot: f64,
-    strike: f64,
     years_to_maturity: f64,
     risk_free_rate: f64,
     dividend_yield: f64,
@@ -768,10 +1342,22 @@ fn scenario_greeks(
     parity: f64,
     fx_rate: f64,
 ) -> Option<crate::indicators::options::BlackScholesGreeks> {
+    if signal.pricing_model != "warrant_intrinsic" {
+        let delta = linear_delta(kind, spot, signal.strike, signal.barrier, parity, fx_rate)?;
+        return Some(crate::indicators::options::BlackScholesGreeks {
+            delta,
+            gamma: 0.0,
+            vega_per_vol_point: 0.0,
+            theta_per_day: 0.0,
+            rho_per_rate_point: 0.0,
+            d1: 0.0,
+            d2: 0.0,
+        });
+    }
     let raw = black_scholes_greeks(BlackScholesInput {
         kind,
         spot,
-        strike,
+        strike: signal.strike,
         years_to_maturity,
         risk_free_rate,
         dividend_yield,
@@ -825,6 +1411,7 @@ fn solve_breakeven_underlying(
     kind: OptionKind,
     signal: &OpportunitySignal,
     years_remaining: f64,
+    years_to_target: f64,
     volatility: f64,
     config: &ScenarioConfig,
     decision_config: &DecisionConfig,
@@ -840,7 +1427,7 @@ fn solve_breakeven_underlying(
         let mid = (low + high) / 2.0;
         let dividend_pv = present_value_dividends(
             config.target_date,
-            parse_date(&signal.maturity)?,
+            scenario_maturity(signal, config)?.date,
             config.risk_free_rate,
             &config.dividends,
         );
@@ -858,15 +1445,17 @@ fn solve_breakeven_underlying(
         .abs();
         let spread_multiplier = dynamic_exit_spread_multiplier(config, raw_delta_abs);
         let price = scenario_product_price(
+            signal,
             kind,
             pricing_mid,
-            signal.strike,
             years_remaining,
+            years_to_target,
             config.risk_free_rate,
             scenario_dividend_yield(config),
             volatility,
             signal.warrants_per_underlying?,
             config.fx_target_rate.unwrap_or(signal.fx_rate),
+            config,
         )?;
         let price = apply_exit_spread_penalty(price, signal.spread_pct, spread_multiplier);
         let net = net_return_after_fees(
@@ -905,6 +1494,9 @@ fn theta_horizon_pct(
     maturity: NaiveDate,
     config: &ScenarioConfig,
 ) -> Option<f64> {
+    if signal.pricing_model != "warrant_intrinsic" {
+        return Some(0.0);
+    }
     if entry_price <= 0.0 {
         return None;
     }
@@ -912,26 +1504,30 @@ fn theta_horizon_pct(
     let years_remaining = years_between(target_date, maturity)?;
     let parity = signal.warrants_per_underlying?;
     let model_now = scenario_product_price(
+        signal,
         kind,
         spot,
-        signal.strike,
         years_to_maturity,
+        0.0,
         config.risk_free_rate,
         config.dividend_yield,
         volatility,
         parity,
         signal.fx_rate,
+        config,
     )?;
     let model_at_target_same_spot = scenario_product_price(
+        signal,
         kind,
         spot,
-        signal.strike,
         years_remaining,
+        years_between(today, target_date)?,
         config.risk_free_rate,
         config.dividend_yield,
         volatility,
         parity,
         signal.fx_rate,
+        config,
     )?;
     let decay = (model_now - model_at_target_same_spot).max(0.0);
     Some(decay / entry_price * 100.0)
@@ -972,14 +1568,41 @@ fn scenario_decision(
         && score >= thresholds.min_buy_score
     {
         "BUY"
-    } else if net_return_pct > 0.0 && reasons.len() <= 1 {
+    } else if net_return_pct > 0.0
+        && (reasons.len() <= 1 || reasons.iter().all(|reason| scenario_reason_allows_watch(reason)))
+    {
         "WATCH"
     } else {
         "AVOID"
     }
 }
 
+fn scenario_reason_allows_watch(reason: &str) -> bool {
+    matches!(
+        reason,
+        "scenario_return_below_buy_threshold"
+            | "target_probability_too_low"
+            | "breakeven_probability_too_low"
+            | "expected_value_negative"
+            | "monte_carlo_ev_negative"
+            | "target_before_stop_not_favored"
+            | "barrier_touch_probability_too_high"
+            | "linear_financing_unmodeled_long_horizon"
+            | "maturity_before_preferred_window"
+            | "maturity_after_preferred_window"
+            | "volatility_crush_erases_return"
+            | "fx_stress_erases_return"
+    )
+}
+
 fn read_env_f64(name: &str) -> Option<f64> {
+    std::env::var(name)
+        .ok()
+        .as_deref()
+        .and_then(|value| value.parse().ok())
+}
+
+fn read_env_i64(name: &str) -> Option<i64> {
     std::env::var(name)
         .ok()
         .as_deref()
@@ -1037,6 +1660,43 @@ fn parse_date(value: &str) -> Option<NaiveDate> {
     NaiveDate::parse_from_str(value, "%Y-%m-%d").ok()
 }
 
+struct ScenarioMaturity {
+    date: NaiveDate,
+    label: String,
+    is_open_end: bool,
+}
+
+fn scenario_maturity(signal: &OpportunitySignal, config: &ScenarioConfig) -> Option<ScenarioMaturity> {
+    if let Some(date) = parse_date(&signal.maturity) {
+        return Some(ScenarioMaturity {
+            date,
+            label: signal.maturity.clone(),
+            is_open_end: false,
+        });
+    }
+    if signal.maturity == "open-end" {
+        let date = config
+            .max_maturity
+            .or_else(|| NaiveDate::from_ymd_opt(config.target_date.year() + 5, 12, 31))?;
+        return Some(ScenarioMaturity {
+            date,
+            label: "open-end".to_string(),
+            is_open_end: true,
+        });
+    }
+    None
+}
+
+fn is_supported_scenario_model(signal: &OpportunitySignal) -> bool {
+    matches!(
+        signal.pricing_model.as_str(),
+        "warrant_intrinsic" | "financing_level" | "barrier_only"
+    ) && matches!(
+        signal.product_family.as_str(),
+        "warrant" | "turbo" | "mini_future" | "open_end_knock_out"
+    )
+}
+
 fn option_kind(side: &str) -> Option<OptionKind> {
     match side {
         "call" => Some(OptionKind::Call),
@@ -1090,6 +1750,9 @@ mod tests {
             vol_spot_slope_points_per_pct: -0.50,
             exit_spread_multiplier: 1.5,
             exit_spread_delta_penalty: 0.75,
+            linear_financing_rate: 0.0,
+            monte_carlo_paths: 0,
+            monte_carlo_max_steps: 64,
             stale_pricing_guard: false,
             paris_hour: None,
             dividends: Vec::new(),
@@ -1435,8 +2098,8 @@ mod tests {
     #[test]
     fn non_warrant_products_are_rejected() {
         let mut turbo = signal();
-        turbo.product_family = "turbo".to_string();
-        turbo.pricing_model = "financing_level".to_string();
+        turbo.product_family = "certificate".to_string();
+        turbo.pricing_model = "unsupported".to_string();
 
         let candidates = analyze_warrant_scenario(
             &[turbo],
@@ -1447,6 +2110,191 @@ mod tests {
         );
 
         assert!(candidates.is_empty());
+    }
+
+    #[test]
+    fn financing_product_is_projected_linearly_without_theta() {
+        let mut turbo = signal();
+        turbo.symbol = "TURBOPUT".to_string();
+        turbo.side = "put".to_string();
+        turbo.product_family = "mini_future".to_string();
+        turbo.pricing_model = "financing_level".to_string();
+        turbo.product_type = "Mini-Future Short".to_string();
+        turbo.maturity = "open-end".to_string();
+        turbo.strike = 1800.0;
+        turbo.barrier = Some(1800.0);
+        turbo.warrants_per_underlying = Some(100.0);
+        turbo.ask_price = Some(2.70);
+        turbo.bid_price = Some(2.68);
+        turbo.mid_price = Some(2.69);
+        turbo.last_price = 2.70;
+        turbo.implied_volatility = None;
+        turbo.smile_median_iv = None;
+        let scenario = ScenarioConfig {
+            side: "auto".to_string(),
+            target_price: 1300.0,
+            ..scenario()
+        };
+
+        let candidates = analyze_warrant_scenario(
+            &[turbo],
+            1533.5,
+            &scenario,
+            &DecisionConfig::default(),
+            NaiveDate::from_ymd_opt(2026, 5, 18).unwrap(),
+        );
+
+        assert_eq!(candidates.len(), 1);
+        let candidate = &candidates[0];
+        assert_eq!(candidate.product_family, "mini_future");
+        assert_eq!(candidate.pricing_model, "financing_level");
+        assert_eq!(candidate.maturity_label, "open-end");
+        assert_close(candidate.projected_price, 5.0, 1e-9);
+        assert_eq!(candidate.theta_horizon_pct, Some(0.0));
+        assert_eq!(candidate.vega_per_vol_point, Some(0.0));
+        assert!(candidate.net_return_pct > 0.0);
+        assert_eq!(candidate.decision, "WATCH");
+        assert!(candidate
+            .reasons
+            .contains(&"linear_financing_unmodeled_long_horizon".to_string()));
+        assert!(candidate
+            .warnings
+            .contains(&"linear_product_projection".to_string()));
+        assert!(candidate
+            .warnings
+            .contains(&"future_financing_not_projected".to_string()));
+        assert!(candidate
+            .warnings
+            .contains(&"open_end_no_expiry_model".to_string()));
+    }
+
+    #[test]
+    fn open_end_call_financing_raises_reference_and_reduces_projection() {
+        let mut turbo = signal();
+        turbo.symbol = "TURBOCALL".to_string();
+        turbo.product_family = "mini_future".to_string();
+        turbo.pricing_model = "financing_level".to_string();
+        turbo.product_type = "Mini-Future Long".to_string();
+        turbo.maturity = "open-end".to_string();
+        turbo.strike = 1700.0;
+        turbo.barrier = Some(1600.0);
+        turbo.warrants_per_underlying = Some(100.0);
+        turbo.ask_price = Some(1.20);
+        turbo.bid_price = Some(1.19);
+        turbo.mid_price = Some(1.195);
+        turbo.last_price = 1.20;
+        let scenario = ScenarioConfig {
+            target_price: 2000.0,
+            linear_financing_rate: 0.10,
+            ..scenario()
+        };
+
+        let candidates = analyze_warrant_scenario(
+            &[turbo],
+            1533.5,
+            &scenario,
+            &DecisionConfig::default(),
+            NaiveDate::from_ymd_opt(2026, 5, 18).unwrap(),
+        );
+
+        assert_eq!(candidates.len(), 1);
+        let candidate = &candidates[0];
+        assert!(candidate.projected_reference > 1700.0);
+        assert!(candidate.projected_price < (2000.0 - 1700.0) / 100.0);
+        assert!(candidate.financing_drag_pct.unwrap() < 0.0);
+        assert!(candidate
+            .warnings
+            .contains(&"future_financing_projected".to_string()));
+        assert!(!candidate
+            .reasons
+            .contains(&"linear_financing_unmodeled_long_horizon".to_string()));
+    }
+
+    #[test]
+    fn open_end_put_financing_lowers_reference_and_reduces_projection() {
+        let mut turbo = signal();
+        turbo.symbol = "TURBOPUT".to_string();
+        turbo.side = "put".to_string();
+        turbo.product_family = "mini_future".to_string();
+        turbo.pricing_model = "financing_level".to_string();
+        turbo.product_type = "Mini-Future Short".to_string();
+        turbo.maturity = "open-end".to_string();
+        turbo.strike = 1800.0;
+        turbo.barrier = Some(1800.0);
+        turbo.warrants_per_underlying = Some(100.0);
+        turbo.ask_price = Some(2.70);
+        turbo.bid_price = Some(2.68);
+        turbo.mid_price = Some(2.69);
+        turbo.last_price = 2.70;
+        let scenario = ScenarioConfig {
+            side: "auto".to_string(),
+            target_price: 1300.0,
+            linear_financing_rate: 0.10,
+            ..scenario()
+        };
+
+        let candidates = analyze_warrant_scenario(
+            &[turbo],
+            1533.5,
+            &scenario,
+            &DecisionConfig::default(),
+            NaiveDate::from_ymd_opt(2026, 5, 18).unwrap(),
+        );
+
+        assert_eq!(candidates.len(), 1);
+        let candidate = &candidates[0];
+        assert!(candidate.projected_reference < 1800.0);
+        assert!(candidate.projected_price < (1800.0 - 1300.0) / 100.0);
+        assert!(candidate.financing_drag_pct.unwrap() < 0.0);
+    }
+
+    #[test]
+    fn barrier_touch_probability_increases_when_barrier_is_close() {
+        let near = barrier_touch_probability(
+            OptionKind::Call,
+            100.0,
+            Some(95.0),
+            0.25,
+            0.05,
+            0.25,
+        )
+        .unwrap();
+        let far = barrier_touch_probability(
+            OptionKind::Call,
+            100.0,
+            Some(70.0),
+            0.25,
+            0.05,
+            0.25,
+        )
+        .unwrap();
+
+        assert!(near > far);
+        assert!(near > 0.0);
+        assert!(far >= 0.0);
+    }
+
+    #[test]
+    fn monte_carlo_stats_are_deterministic_and_populated() {
+        let scenario = ScenarioConfig {
+            monte_carlo_paths: 128,
+            monte_carlo_max_steps: 32,
+            ..scenario()
+        };
+        let candidates = analyze_warrant_scenario(
+            &[signal()],
+            1533.5,
+            &scenario,
+            &DecisionConfig::default(),
+            NaiveDate::from_ymd_opt(2026, 5, 18).unwrap(),
+        );
+
+        assert_eq!(candidates.len(), 1);
+        let candidate = &candidates[0];
+        assert!(candidate.monte_carlo_expected_return_pct.is_some());
+        assert!(candidate.monte_carlo_p05_return_pct.unwrap() <= candidate.monte_carlo_p50_return_pct.unwrap());
+        assert!(candidate.monte_carlo_p50_return_pct.unwrap() <= candidate.monte_carlo_p95_return_pct.unwrap());
+        assert!(candidate.monte_carlo_target_first_pct.unwrap() >= 0.0);
     }
 
     #[test]
@@ -1499,6 +2347,26 @@ mod tests {
             .reasons
             .contains(&"liquidity_too_low".to_string()));
         assert_ne!(candidates[0].decision, "AVOID");
+    }
+
+    #[test]
+    fn soft_buy_blockers_keep_positive_candidate_on_watch() {
+        let thresholds = ScenarioDecisionThresholds::default();
+        let reasons = vec![
+            "expected_value_negative".to_string(),
+            "linear_financing_unmodeled_long_horizon".to_string(),
+        ];
+
+        assert_eq!(scenario_decision(20.0, 85.0, &reasons, &thresholds), "WATCH");
+
+        let hard_reasons = vec![
+            "spread_too_wide".to_string(),
+            "linear_financing_unmodeled_long_horizon".to_string(),
+        ];
+        assert_eq!(
+            scenario_decision(20.0, 85.0, &hard_reasons, &thresholds),
+            "AVOID"
+        );
     }
 
     #[test]
@@ -1611,6 +2479,9 @@ mod tests {
             vol_spot_slope_points_per_pct: -0.50,
             exit_spread_multiplier: 1.5,
             exit_spread_delta_penalty: 0.75,
+            linear_financing_rate: 0.0,
+            monte_carlo_paths: 0,
+            monte_carlo_max_steps: 64,
             stale_pricing_guard: false,
             paris_hour: None,
             dividends: Vec::new(),

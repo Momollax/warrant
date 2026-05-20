@@ -958,29 +958,54 @@ Remplace `call` par `auto` pour laisser le moteur comparer calls et puts; garde 
 Logique:
 
 ```text
-produits warrants nettoyes
+produits scenario nettoyes
   -> mode auto: conserve calls et puts, sauf filtre explicite call/put
   -> filtre maturite apres la date cible
   -> filtre fenetre de maturite voulue
   -> prix d'entree = ask executable
-  -> projection Black-Scholes a la date cible
+  -> projection Black-Scholes ou lineaire selon le modele produit
   -> application des frais broker
   -> calcul rendement net, point mort sous-jacent, score intentionnel
 ```
 
-En mode `SCENARIO_SIDE=auto`, le type nominal du warrant (`call` ou `put`) sert au pricing Black-Scholes du produit, mais la probabilite `Tch<=D` suit la direction de la these de marche: cible au-dessus du spot = first-touch haussier, cible sous le spot = first-touch baissier. Cela evite le faux 100% qui apparaitrait si un call etait evalue sur une cible situee sous le spot.
+En mode `SCENARIO_SIDE=auto`, le type nominal du produit (`call` ou `put`) sert au pricing du produit, mais la probabilite `Tch<=D` suit la direction de la these de marche: cible au-dessus du spot = first-touch haussier, cible sous le spot = first-touch baissier. Cela evite le faux 100% qui apparaitrait si un call etait evalue sur une cible situee sous le spot.
+
+Modeles scenario actuellement supportes:
+
+| Famille / modele | Projection | Theta / Vega |
+| --- | --- | --- |
+| `warrant / warrant_intrinsic` | Black-Scholes a la date cible avec IV, FX, dividendes et spread de sortie | Oui |
+| `turbo / financing_level` | `max(direction * (S_target - financement), 0) / parite * fx` | Non |
+| `mini_future / financing_level` | meme projection lineaire | Non |
+| `open_end_knock_out / financing_level` | projection lineaire, maturite affichee `open-end` | Non |
+| `open_end_knock_out / barrier_only` | projection lineaire sur reference/barriere disponible | Non |
+
+Les certificats a payoff conditionnel (`discount`, `bonus`, `express`, leverage constant, etc.) restent exclus du mode scenario tant que leur payoff contractuel n'est pas modelise.
+
+Pour les produits lineaires open-end sans taux de financement renseigne, le niveau de financement/barriere futur n'est pas projete. Le moteur ajoute donc `future_financing_not_projected`. Si la cible est a plus de `SCENARIO_MAX_UNMODELED_LINEAR_BUY_DAYS` jours, il ajoute aussi `linear_financing_unmodeled_long_horizon`, ce qui bloque `BUY` mais garde le produit visible en `WATCH` si les autres conditions sont positives.
+
+Si `SCENARIO_LINEAR_FINANCING_RATE_PCT` est renseigne, la reference de financement/barriere open-end est projetee:
+
+```text
+call reference_future = reference_now * exp(financing_rate * T)
+put  reference_future = reference_now * exp(-financing_rate * T)
+```
+
+Cela modelise l'erosion economiquement defavorable aux deux sens: le niveau monte pour un long/call et baisse pour un short/put. Le champ `financing_drag_pct` mesure l'impact sur le prix de sortie par rapport a une reference non projetee.
 
 Champs principaux:
 
 | Champ | Sens |
 | --- | --- |
-| `targetPx` | Prix warrant estime a la date cible si le sous-jacent atteint le prix cible. |
+| `targetPx` | Prix produit estime a la date cible si le sous-jacent atteint le prix cible. |
 | `net%` | Rendement estime net de frais broker. |
 | `gross%` | Rendement brut avant frais. |
 | `BE` | Cours sous-jacent a atteindre a la date cible pour etre a l'equilibre net de frais. |
 | `fee%` | Cout total achat/depot/vente en pourcentage du montant d'ordre. |
 | `iv%` | Volatilite implicite actuelle quand elle est disponible. |
 | `score` | Score de coherence: rendement net, qualite de donnees, liquidite, spread, IV relative et fit de maturite. |
+| `KO%` | Probabilite first-touch de barriere avant la date cible. |
+| `MCev` | Esperance de rendement de la simulation Monte Carlo target/stop/KO. |
 
 Indicateurs mathematiques et statistiques ajoutes:
 
@@ -1006,11 +1031,34 @@ References de formule:
 - William F. Sharpe: ratio rendement/variabilite.
 - J. L. Kelly: maximisation de la croissance logarithmique, fraction de capital.
 
+Monte Carlo:
+
+```text
+S_{t+dt} = S_t * exp((mu - 0.5*sigma^2)*dt + sigma*sqrt(dt)*Z)
+```
+
+Le moteur utilise le drift reel configure (`SCENARIO_REAL_DRIFT_PCT`) pour les trajectoires. A chaque pas il revalorise le produit, teste le target, le stop et la barriere. Les sorties sont:
+
+- `target_first_pct`
+- `stop_first_pct`
+- `ko_pct`
+- `monte_carlo_expected_return_pct`
+- `p05/p50/p95` du P/L
+
 Decision:
 
 - `BUY`: le scenario est positif, liquide, executable, avec rendement net suffisant;
 - `WATCH`: le scenario est interessant mais fragile ou incomplet;
 - `AVOID`: rendement negatif, liquidite trop basse, spread trop large, point mort au-dela de la cible, ou donnees insuffisantes.
+
+Garde-fous supplementaires:
+
+- `expected_value_negative`: EV risk-neutral negative; bloque `BUY`, mais peut rester `WATCH` si le payoff conditionnel au target est positif;
+- `monte_carlo_ev_negative`: EV Monte Carlo negative; bloque `BUY`, mais peut rester `WATCH`;
+- `target_before_stop_not_favored`: le stop/KO arrive au moins aussi souvent que le target;
+- `barrier_touch_probability_too_high`: probabilite KO superieure a `SCENARIO_MAX_BUY_KO_PROB_PCT`;
+- `linear_financing_unmodeled_long_horizon`: produit lineaire open-end sur horizon long; bloque `BUY` tant que le financement futur n'est pas projete;
+- `SCENARIO_MAX_UNMODELED_LINEAR_BUY_DAYS`: seuil de jours pour ce garde-fou, `45` par defaut.
 
 Ce mode ne predit pas que le sous-jacent ira au prix cible. Il repond seulement a la question: "si mon intention de marche se realise, quel warrant exprime le mieux cette idee compte tenu du prix, de la maturite, de l'IV, de la liquidite et des frais ?"
 

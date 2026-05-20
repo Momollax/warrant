@@ -328,9 +328,6 @@ impl<'a> ComparableProduct<'a> {
         }
         let spec = pricing_spec(product)?;
         let pricing_model = spec.model;
-        if !require_positive_intrinsic && pricing_model != PricingModel::WarrantIntrinsic {
-            return None;
-        }
         let reference_currency = if spec.reference_currency.is_empty() {
             spot_currency.to_string()
         } else {
@@ -392,7 +389,7 @@ impl<'a> ComparableProduct<'a> {
             fx_rates,
             price_to_intrinsic,
         )?;
-        if !is_relative_metric_plausible(pricing_model, relative_metric) {
+        if require_positive_intrinsic && !is_relative_metric_plausible(pricing_model, relative_metric) {
             return None;
         }
         let bid_price = quote_price.bid;

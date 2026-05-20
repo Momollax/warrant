@@ -119,6 +119,11 @@ SCENARIO_MIN_BUY_SCORE=70
 SCENARIO_MIN_BUY_TARGET_PROB_PCT=10
 SCENARIO_MIN_BUY_BREAKEVEN_PROB_PCT=20
 SCENARIO_SCORE_RETURN_TARGET_PCT=20
+SCENARIO_MAX_UNMODELED_LINEAR_BUY_DAYS=45
+SCENARIO_LINEAR_FINANCING_RATE_PCT=0
+SCENARIO_MAX_BUY_KO_PROB_PCT=30
+SCENARIO_MC_PATHS=512
+SCENARIO_MC_MAX_STEPS=128
 SCENARIO_VOL_SHOCK_POINTS=-5
 
 LLM_ENABLE=0
@@ -223,10 +228,10 @@ Exemple Hermes baissier:
 BROKER_FEE_PROFILE=bourse_direct_1000 FEE_ORDER_NOTIONAL=1000 CANDLES_RANGE=60d CANDLES_INTERVAL=60m MARKET_DATA_REFRESH=cache ./manage.sh scenario hermes RMS.PA 1300 2026-10-31 2027-01-01 2027-03-31 500
 ```
 
-Le mode `auto` choisit:
+Le mode par defaut garde les deux cotes (`call` et `put`) et laisse le moteur classer les produits. Le sens de la these vient du target:
 
-- `call` si le target est au-dessus du spot
-- `put` si le target est sous le spot
+- target au-dessus du spot: probabilites first-touch calculees comme scenario haussier
+- target sous le spot: probabilites first-touch calculees comme scenario baissier
 
 Forcer une direction:
 
@@ -333,8 +338,12 @@ Colonnes utiles du mode scenario:
 - `Str@D`: rendement net a la date cible si l'IV baisse de `SCENARIO_VOL_SHOCK_POINTS`
 - `BE mv`: mouvement minimum du sous-jacent pour atteindre le point mort
 - `Tch<=D`: probabilite first-touch d'atteindre la cible avant ou a la date scenario
+- `KO%`: probabilite first-touch de barriere/knock-out avant la date cible, si barriere connue
+- `MCev`: esperance de rendement de la simulation Monte Carlo target/stop/KO
+- `Type`: famille/model du produit (`Warrant`, `Turbo`, `MiniF`, `KO-fin`, `KO-bar`)
 - `EntryAsk`: prix d'entree acheteur utilise
 - `ExitBid@D`: prix de sortie bid estime a la date cible, hors frais broker
+- `IVout`: IV de sortie pour warrant vanilla; `linear` pour produit lineaire sans IV/theta/vega Black-Scholes
 - `Strike`, `Maturite`, `Par`: caracteristiques du contrat a verifier avant toute decision
 
 Quand l'ecran est assez large, le panneau Notes affiche aussi une droite de decision:
@@ -347,13 +356,64 @@ Quand l'ecran est assez large, le panneau Notes affiche aussi une droite de deci
 
 La droite n'est pas une prediction du chemin du prix. Elle sert a lire l'ordre des seuils: stop, spot, breakeven et target. Elle permet de voir tout de suite si le target est avant ou apres le point mort.
 
-Le point mort `B` est calcule avec Black-Scholes a la date cible:
+Le point mort `B` depend du modele du produit. Pour un warrant vanilla, il est calcule avec Black-Scholes a la date cible:
 
 ```text
 net_return(BlackScholes(S_BE, K, T_target_to_maturity, r, q, vol) / parite * fx) = 0
 ```
 
-Il est donc influence par la valeur temps restante, par l'IV utilisee, par les frais et par le spread. Si le sous-jacent atteint ce niveau plus tot ou plus tard que la date cible, le point mort reel peut etre different.
+Pour un turbo, mini-future ou knock-out a financement, il est calcule par projection lineaire:
+
+```text
+intrinsic = max(direction * (S_BE - niveau_financement), 0)
+prix = intrinsic / parite * fx
+```
+
+Ces produits ne recoivent pas de theta/vega Black-Scholes artificiels dans le scenario. Leur risque principal vient plutot du niveau de financement, de la barriere, du spread, du FX et du financement implicite de l'emetteur. Si le sous-jacent atteint le niveau plus tot ou plus tard que la date cible, le point mort reel peut etre different.
+
+Le niveau de financement/barriere futur est projete si `SCENARIO_LINEAR_FINANCING_RATE_PCT` est renseigne. Pour un open-end call, la reference augmente avec le cout de financement; pour un open-end put, elle diminue. La formule interne est:
+
+```text
+call reference_future = reference_now * exp(financing_rate * T)
+put  reference_future = reference_now * exp(-financing_rate * T)
+```
+
+Si ce taux reste a `0`, le moteur utilise la reference actuelle. Pour une these longue sur plusieurs mois ou annees, il faut donc lire le resultat comme une approximation du payoff lineaire, pas comme une promesse de prix futur exact.
+
+Par defaut, un produit lineaire open-end dont le target est a plus de `SCENARIO_MAX_UNMODELED_LINEAR_BUY_DAYS` jours ne peut pas etre classe `BUY` si `SCENARIO_LINEAR_FINANCING_RATE_PCT=0`. Il reste affiche, mais il passe au minimum en `WATCH` avec la raison `linear_financing_unmodeled_long_horizon`. Ce garde-fou evite de transformer une projection lineaire propre a court terme en faux signal fort sur plusieurs mois, car le niveau de financement futur n'est pas encore connu.
+
+### Barriere / KO
+
+Si une barriere est connue, le moteur calcule une probabilite first-touch avant la date cible:
+
+```text
+KO% = P(S_t touche la barriere avant target_date)
+```
+
+Pour un produit haussier avec barriere basse, on calcule une first-touch baissiere. Pour un produit baissier avec barriere haute, on calcule une first-touch haussiere. Si `KO% > SCENARIO_MAX_BUY_KO_PROB_PCT`, le moteur ajoute `barrier_touch_probability_too_high` et bloque `BUY`.
+
+### Monte Carlo
+
+Le moteur simule des trajectoires GBM:
+
+```text
+S_next = S * exp((mu - 0.5 * sigma^2) * dt + sigma * sqrt(dt) * Z)
+```
+
+Puis il observe dans chaque trajectoire:
+
+- target touche avant stop/KO
+- stop touche avant target
+- KO touche avant target
+- P/L final si rien n'est touche avant la date cible
+
+Les champs affiches sont:
+
+- `MCev`: moyenne des P/L simules
+- `p05`, `p50`, `p95` dans les notes: percentiles pessimiste, median et favorable
+- `target_first`, `stop_first`, `KO` dans les notes
+
+Si `MCev < 0`, le moteur ajoute `monte_carlo_ev_negative`. Si le stop/KO arrive au moins aussi souvent que le target, il ajoute `target_before_stop_not_favored`.
 
 ## 7. Concepts financiers utilises
 
@@ -444,6 +504,24 @@ Ce calcul integre deja:
 
 - le compte a rebours: `T_target_to_maturity` diminue quand la date cible avance, donc la valeur temps restante baisse
 - le delta: Black-Scholes ne suppose pas un levier fixe; le prix reagit selon la position du warrant face au strike
+
+### Turbos, mini-futures et open-end
+
+Les produits lineaires compatibles sont maintenant gardes en mode `scenario`:
+
+- `turbo / financing_level`
+- `mini_future / financing_level`
+- `open_end_knock_out / financing_level`
+- `open_end_knock_out / barrier_only`
+
+Le moteur les projette avec leur valeur intrinseque future:
+
+```text
+call: max(S_target - reference, 0) / parite * fx
+put:  max(reference - S_target, 0) / parite * fx
+```
+
+Si une barriere est fournie et que le target la traverse du mauvais cote, le prix projete tombe a `0`. Pour les produits `open-end`, la maturite affichee reste `open-end`; une date interne synthétique sert seulement aux calculs auxiliaires, et le theta est force a `0`.
 - le vega: le prix depend de `vol`
 
 Le moteur ajoute aussi un stress de volatilite:
@@ -489,6 +567,8 @@ fair_now = BlackScholes(spot actuel, strike, maturite)
 expected_exit = fair_now * exp(r * T_to_target)
 EV = rendement net attendu apres frais
 ```
+
+Si `EV < 0`, le moteur ajoute `expected_value_negative`. Le produit peut rester `WATCH` si le scenario cible est interessant, mais il ne doit pas sortir en `BUY`: cela signifie que le prix d'entree est cher selon le modele risk-neutral, meme si le payoff conditionnel au target parait attractif.
 
 Elle ne represente pas une conviction humaine. Elle sert a comparer le prix du produit avec une valorisation theorique.
 
@@ -573,6 +653,11 @@ SCENARIO_MIN_BUY_SCORE=70
 SCENARIO_MIN_BUY_TARGET_PROB_PCT=10
 SCENARIO_MIN_BUY_BREAKEVEN_PROB_PCT=20
 SCENARIO_SCORE_RETURN_TARGET_PCT=20
+SCENARIO_MAX_UNMODELED_LINEAR_BUY_DAYS=45
+SCENARIO_LINEAR_FINANCING_RATE_PCT=0
+SCENARIO_MAX_BUY_KO_PROB_PCT=30
+SCENARIO_MC_PATHS=512
+SCENARIO_MC_MAX_STEPS=128
 SCENARIO_VOL_SHOCK_POINTS=-5
 ```
 
@@ -815,8 +900,8 @@ Commande:
 
 Limites importantes:
 
-- Le moteur scenario traite principalement les warrants vanilla compatibles Black-Scholes.
-- Certains turbos, bonus, certificats complexes ou produits exotiques ne sont pas encore modelises en scenario.
+- Le moteur scenario traite les warrants vanilla compatibles Black-Scholes et les produits lineaires a financement/barriere.
+- Les bonus, discounts, express, certificats a payoff conditionnel ou produits exotiques ne sont pas encore modelises en scenario.
 - Le Kelly actuel est binaire et tres conservateur.
 - Le moteur ne modelise pas encore une strategie complete avec stop dynamique, prise partielle, sortie temporelle et trailing stop.
 - Les stops prives, liquidations reelles et gros ordres caches ne sont pas observables directement sur actions.
