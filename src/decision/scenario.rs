@@ -178,7 +178,7 @@ fn analyze_signal(
     if signal.product_family != "warrant" || signal.pricing_model != "warrant_intrinsic" {
         return None;
     }
-    if signal.side != config.side {
+    if !scenario_side_accepts(&config.side, &signal.side) {
         return None;
     }
     let maturity = parse_date(&signal.maturity)?;
@@ -328,8 +328,9 @@ fn analyze_signal(
     });
     let breakeven_underlying =
         solve_breakeven_underlying(kind, signal, years_remaining, exit_volatility, config, decision_config);
+    let scenario_direction = direction_for_level(spot, config.target_price)?;
     let breakeven_distance_pct =
-        breakeven_underlying.map(|value| directional_distance_pct(kind, spot, value));
+        breakeven_underlying.map(|value| signed_move_pct(spot, value));
     let theta_horizon_pct = theta_horizon_pct(
         kind,
         signal,
@@ -342,7 +343,7 @@ fn analyze_signal(
         config,
     );
     let probability = scenario_probabilities(
-        kind,
+        scenario_direction,
         spot,
         config.target_price,
         breakeven_underlying,
@@ -413,9 +414,8 @@ fn analyze_signal(
     if signal.spread_pct.unwrap_or(f64::INFINITY) > decision_config.max_spread_pct {
         reasons.push("spread_too_wide".to_string());
     }
-    if breakeven_distance_pct.is_some_and(|distance| {
-        let target_distance = directional_distance_pct(kind, spot, config.target_price);
-        distance > target_distance
+    if breakeven_underlying.is_some_and(|breakeven| {
+        !target_reaches_breakeven(kind, config.target_price, breakeven)
     }) {
         reasons.push("breakeven_beyond_target".to_string());
     }
@@ -445,6 +445,9 @@ fn analyze_signal(
     }
     if effective_exit_spread_multiplier > config.exit_spread_multiplier * 1.05 {
         warnings.push("dynamic_exit_spread_penalty".to_string());
+    }
+    if option_kind(&config.side).is_none() && kind != scenario_direction {
+        warnings.push("opposite_side_scenario".to_string());
     }
 
     let score = scenario_score(
@@ -629,7 +632,7 @@ struct ScenarioProbabilities {
 }
 
 fn scenario_probabilities(
-    kind: OptionKind,
+    scenario_direction: OptionKind,
     spot: f64,
     target_price: f64,
     breakeven_underlying: Option<f64>,
@@ -639,7 +642,7 @@ fn scenario_probabilities(
     volatility: f64,
 ) -> ScenarioProbabilities {
     let terminal_target = lognormal_probability(
-        kind,
+        scenario_direction,
         spot,
         target_price,
         years_to_target,
@@ -648,11 +651,12 @@ fn scenario_probabilities(
     )
         .map(|(probability, zscore)| (probability * 100.0, zscore));
     let breakeven = breakeven_underlying.and_then(|level| {
-        lognormal_probability(kind, spot, level, years_to_target, risk_neutral_drift, volatility)
+        let direction = direction_for_level(spot, level)?;
+        lognormal_probability(direction, spot, level, years_to_target, risk_neutral_drift, volatility)
             .map(|(probability, zscore)| (probability * 100.0, zscore))
     });
     let touch_target = first_touch_probability(
-        kind,
+        scenario_direction,
         spot,
         target_price,
         years_to_target,
@@ -661,7 +665,8 @@ fn scenario_probabilities(
     )
     .map(|probability| probability * 100.0);
     let touch_breakeven = breakeven_underlying.and_then(|level| {
-        first_touch_probability(kind, spot, level, years_to_target, real_world_drift, volatility)
+        let direction = direction_for_level(spot, level)?;
+        first_touch_probability(direction, spot, level, years_to_target, real_world_drift, volatility)
             .map(|probability| probability * 100.0)
     });
 
@@ -998,6 +1003,31 @@ fn directional_distance_pct(kind: OptionKind, spot: f64, target: f64) -> f64 {
     }
 }
 
+fn signed_move_pct(spot: f64, target: f64) -> f64 {
+    if spot <= 0.0 {
+        return 0.0;
+    }
+    (target - spot) / spot * 100.0
+}
+
+fn direction_for_level(spot: f64, level: f64) -> Option<OptionKind> {
+    if spot <= 0.0 || level <= 0.0 {
+        return None;
+    }
+    if level >= spot {
+        Some(OptionKind::Call)
+    } else {
+        Some(OptionKind::Put)
+    }
+}
+
+fn target_reaches_breakeven(kind: OptionKind, target_price: f64, breakeven: f64) -> bool {
+    match kind {
+        OptionKind::Call => target_price >= breakeven,
+        OptionKind::Put => target_price <= breakeven,
+    }
+}
+
 fn years_between(start: NaiveDate, end: NaiveDate) -> Option<f64> {
     let days = (end - start).num_days();
     (days > 0).then_some(days as f64 / 365.0)
@@ -1012,6 +1042,15 @@ fn option_kind(side: &str) -> Option<OptionKind> {
         "call" => Some(OptionKind::Call),
         "put" => Some(OptionKind::Put),
         _ => None,
+    }
+}
+
+fn scenario_side_accepts(config_side: &str, signal_side: &str) -> bool {
+    match config_side {
+        "call" | "calls" => signal_side == "call",
+        "put" | "puts" => signal_side == "put",
+        "auto" | "all" | "both" | "mixed" => matches!(signal_side, "call" | "put"),
+        _ => matches!(signal_side, "call" | "put"),
     }
 }
 
@@ -1339,6 +1378,58 @@ mod tests {
         assert_eq!(candidates.len(), 1);
         assert_eq!(candidates[0].symbol, "RMSPUT");
         assert_eq!(candidates[0].side, "put");
+    }
+
+    #[test]
+    fn auto_side_keeps_calls_and_puts_for_scenario_pricing() {
+        let mut put = signal();
+        put.symbol = "RMSPUT".to_string();
+        put.side = "put".to_string();
+        put.product_type = "Warrant Put".to_string();
+        put.strike = 1400.0;
+        let scenario = ScenarioConfig {
+            side: "auto".to_string(),
+            target_price: 1800.0,
+            ..scenario()
+        };
+
+        let candidates = analyze_warrant_scenario(
+            &[signal(), put],
+            1533.5,
+            &scenario,
+            &DecisionConfig::default(),
+            NaiveDate::from_ymd_opt(2026, 5, 18).unwrap(),
+        );
+
+        assert_eq!(candidates.len(), 2);
+        assert!(candidates.iter().any(|candidate| candidate.side == "call"));
+        assert!(candidates.iter().any(|candidate| candidate.side == "put"));
+    }
+
+    #[test]
+    fn opposite_side_candidate_uses_market_target_direction_for_touch_probability() {
+        let scenario = ScenarioConfig {
+            side: "auto".to_string(),
+            target_price: 1300.0,
+            volatility_shock_points: 5.0,
+            vol_spot_slope_points_per_pct: -1.0,
+            ..scenario()
+        };
+
+        let candidates = analyze_warrant_scenario(
+            &[signal()],
+            1533.5,
+            &scenario,
+            &DecisionConfig::default(),
+            NaiveDate::from_ymd_opt(2026, 5, 18).unwrap(),
+        );
+
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].side, "call");
+        assert!(candidates[0]
+            .warnings
+            .contains(&"opposite_side_scenario".to_string()));
+        assert!(candidates[0].probability_target_pct.unwrap() < 100.0);
     }
 
     #[test]

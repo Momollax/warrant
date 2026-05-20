@@ -1491,12 +1491,12 @@ fn decision_action_label(decision: DecisionAction) -> &'static str {
     }
 }
 
-fn scenario_side(side: &str, target_price: f64, spot: f64) -> &'static str {
+fn scenario_side(side: &str, _target_price: f64, _spot: f64) -> &'static str {
     match side {
-        "force-call" | "force-calls" => "call",
-        "force-put" | "force-puts" => "put",
-        _ if target_price >= spot => "call",
-        _ => "put",
+        "call" | "calls" | "force-call" | "force-calls" => "call",
+        "put" | "puts" | "force-put" | "force-puts" => "put",
+        "all" | "both" | "mixed" => "auto",
+        _ => "auto",
     }
 }
 

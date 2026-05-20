@@ -953,11 +953,13 @@ Si le terminal est interactif, `manage.sh scenario` ouvre maintenant une vue Rat
 SCENARIO_FORMAT=table ./manage.sh scenario hermes RMS.PA 1800 2026-10-31 2027-01-01 2027-03-31 call 500
 ```
 
+Remplace `call` par `auto` pour laisser le moteur comparer calls et puts; garde `call` ou `put` uniquement pour forcer un cote.
+
 Logique:
 
 ```text
 produits warrants nettoyes
-  -> filtre side call/put selon la these
+  -> mode auto: conserve calls et puts, sauf filtre explicite call/put
   -> filtre maturite apres la date cible
   -> filtre fenetre de maturite voulue
   -> prix d'entree = ask executable
@@ -965,6 +967,8 @@ produits warrants nettoyes
   -> application des frais broker
   -> calcul rendement net, point mort sous-jacent, score intentionnel
 ```
+
+En mode `SCENARIO_SIDE=auto`, le type nominal du warrant (`call` ou `put`) sert au pricing Black-Scholes du produit, mais la probabilite `Tch<=D` suit la direction de la these de marche: cible au-dessus du spot = first-touch haussier, cible sous le spot = first-touch baissier. Cela evite le faux 100% qui apparaitrait si un call etait evalue sur une cible situee sous le spot.
 
 Champs principaux:
 

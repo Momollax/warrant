@@ -399,7 +399,7 @@ fn draw_header(
         ]),
         Line::from(vec![
             Span::styled("These ", Style::default().fg(Color::DarkGray)),
-            Span::styled(config.side.clone(), side_style(&config.side)),
+            Span::styled(side_label(&config.side), side_style(&config.side)),
             Span::raw("  "),
             Span::styled("Maturite ", Style::default().fg(Color::DarkGray)),
             Span::styled(maturity, Style::default().fg(Color::White)),
@@ -470,8 +470,8 @@ fn draw_table(
     decision_config: &DecisionConfig,
 ) {
     let header = Row::new([
-        "Dec", "Score", "Net", "P/L EUR", "Stress", "BE mv", "TchT", "Spr", "Symb",
-        "Strike", "Mat.", "Entry", "Exit", "IVout", "Delta", "DQ",
+        "Dec", "Score", "Net@D", "P/L@D", "Str@D", "BE mv", "Tch<=D", "Spr", "Symb",
+        "Strike", "Maturite", "Par", "EntryAsk", "ExitBid@D", "IVout", "Delta", "DQ",
     ])
     .style(
         Style::default()
@@ -498,8 +498,12 @@ fn draw_table(
             Cell::from(format_optional_plain_pct(candidate.probability_target_pct)),
             Cell::from(format_optional_plain_pct(candidate.spread_pct)),
             Cell::from(candidate.symbol.clone()).style(Style::default().add_modifier(Modifier::BOLD)),
-            Cell::from(format!("{:.2}", candidate.strike)),
-            Cell::from(candidate.maturity.to_string()),
+            Cell::from(format_contract_level(candidate.strike))
+                .style(Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+            Cell::from(candidate.maturity.to_string())
+                .style(Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+            Cell::from(format_compact_float(candidate.parity))
+                .style(Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
             Cell::from(format!("{:.4}", candidate.entry_price)),
             Cell::from(format!("{:.4}", candidate.projected_bid_price)),
             Cell::from(format!("{:.1}%", candidate.exit_volatility * 100.0)),
@@ -511,21 +515,22 @@ fn draw_table(
 
     let widths = [
         Constraint::Length(7),
+        Constraint::Length(6),
+        Constraint::Length(8),
+        Constraint::Length(9),
+        Constraint::Length(8),
+        Constraint::Length(8),
         Constraint::Length(7),
-        Constraint::Length(9),
-        Constraint::Length(9),
-        Constraint::Length(9),
-        Constraint::Length(9),
-        Constraint::Length(8),
-        Constraint::Length(9),
-        Constraint::Length(8),
-        Constraint::Length(9),
-        Constraint::Length(11),
-        Constraint::Length(9),
-        Constraint::Length(8),
-        Constraint::Length(9),
+        Constraint::Length(7),
         Constraint::Length(10),
-        Constraint::Length(5),
+        Constraint::Length(10),
+        Constraint::Length(11),
+        Constraint::Length(6),
+        Constraint::Length(8),
+        Constraint::Length(8),
+        Constraint::Length(7),
+        Constraint::Length(8),
+        Constraint::Length(4),
     ];
 
     let table = Table::new(rows, widths)
@@ -593,7 +598,7 @@ fn draw_details(
                 Line::from(vec![
                     Span::styled("Projection ", Style::default().fg(Color::Yellow)),
                     Span::raw(format!(
-                        "entry ask {:.4} -> sortie bid estimee {:.4} (modele {:.4}); gross {:+.2}% -> net {:+.2}% ({}) apres frais {:.2}%",
+                        "entry ask {:.4} -> sortie bid estimee a la date cible {:.4} (modele {:.4}, hors frais); gross {:+.2}% -> net {:+.2}% ({}) apres frais {:.2}%",
                         candidate.entry_price,
                         candidate.projected_bid_price,
                         candidate.projected_price,
@@ -766,7 +771,7 @@ fn draw_details(
                     Span::raw(status_message.to_string()),
                 ]),
                 Line::from(format!(
-                    "Calc scenario: Black-Scholes({}, S_eff={:.4}, K={:.4}, T cible->maturite, IV_sortie={:.2}%, r={:.2}%, q={:.2}%) / parity {} * fx_sortie {:.4}, puis penalite bid/spread",
+                    "Calc exit@date: Black-Scholes({}, S_eff={:.4}, K={:.4}, T cible->maturite, IV_sortie={:.2}%, r={:.2}%, q={:.2}%) / parity {} * fx_sortie {:.4}, puis penalite bid/spread. Les frais ne sont pas dans ExitBid@D; ils sont dans Net@D/P/L@D.",
                     candidate.side,
                     (config.target_price - candidate.discrete_dividend_pv).max(0.01),
                     candidate.strike,
@@ -777,7 +782,7 @@ fn draw_details(
                     candidate.fx_exit_rate
                 )),
                 Line::from(format!(
-                    "Calc return: ({:.4} - {:.4}) / {:.4} * 100 = {:+.2}% brut; net frais = {:+.2}%",
+                    "Calc return@date: ({:.4} - {:.4}) / {:.4} * 100 = {:+.2}% brut; net apres frais broker = {:+.2}%",
                     candidate.projected_bid_price,
                     candidate.entry_price,
                     candidate.entry_price,
@@ -785,7 +790,7 @@ fn draw_details(
                     candidate.net_return_pct
                 )),
                 Line::from(format!(
-                    "Calc proba: Terminal Q utilise r-q; FirstTouch reel utilise drift reel et proba de toucher le niveau avant la date. Touch target={} Touch BE={} | Terminal target={} Terminal BE={}",
+                    "Calc proba: Tch<=D est une proba first-touch avant la date cible, pas le prix de sortie. ExitBid@D reste calcule exactement a la date cible. Touch target={} Touch BE={} | Terminal target={} Terminal BE={}",
                     format_optional_plain_pct(candidate.probability_target_pct),
                     format_optional_plain_pct(candidate.probability_breakeven_pct),
                     format_optional_plain_pct(candidate.terminal_probability_target_pct),
@@ -868,83 +873,82 @@ fn draw_payoff_chart(
     let Some(candidate) = candidate else {
         frame.render_widget(
             Paragraph::new("Aucun produit selectionne.")
-                .block(Block::default().title(" Rentabilite ").borders(Borders::ALL)),
+                .block(Block::default().title(" Decision line ").borders(Borders::ALL)),
             area,
         );
         return;
     };
     let Some(data) = build_payoff_chart(candidate, underlying, config, decision_config, today) else {
         frame.render_widget(
-            Paragraph::new("Graphique indisponible: donnees insuffisantes.")
-                .block(Block::default().title(" Rentabilite ").borders(Borders::ALL)),
+            Paragraph::new("Decision line indisponible: donnees insuffisantes.")
+                .block(Block::default().title(" Decision line ").borders(Borders::ALL)),
             area,
         );
         return;
     };
 
-    let title_stop = data
-        .stop_move_pct
-        .map(|value| format!("{value:+.1}%"))
-        .unwrap_or_else(|| "-".to_string());
-    let datasets = vec![
+    let mut datasets = vec![Dataset::default()
+        .name("plan lineaire")
+        .marker(symbols::Marker::Braille)
+        .graph_type(GraphType::Line)
+        .style(Style::default().fg(Color::Cyan))
+        .data(&data.plan_line)];
+    let spot_bar = vertical_marker_line(0.0, data.y_bounds);
+    datasets.push(
         Dataset::default()
-            .name("P/L net")
+            .name("S entree")
             .marker(symbols::Marker::Braille)
             .graph_type(GraphType::Line)
-            .style(Style::default().fg(Color::Cyan))
-            .data(&data.curve),
-        Dataset::default()
-            .name("Entree")
-            .marker(symbols::Marker::Dot)
-            .graph_type(GraphType::Scatter)
             .style(Style::default().fg(Color::White).add_modifier(Modifier::BOLD))
-            .data(&data.entry_point),
+            .data(&spot_bar),
+    );
+    let target_bar = vertical_marker_line(data.target_move_pct, data.y_bounds);
+    datasets.push(
         Dataset::default()
-            .name("Stop")
-            .marker(symbols::Marker::Block)
+            .name("T target")
+            .marker(symbols::Marker::Braille)
             .graph_type(GraphType::Line)
-            .style(Style::default().fg(Color::Red))
-            .data(&data.stop_line),
-        Dataset::default()
-            .name("StopPt")
-            .marker(symbols::Marker::Dot)
-            .graph_type(GraphType::Scatter)
-            .style(Style::default().fg(Color::Red).add_modifier(Modifier::BOLD))
-            .data(&data.stop_point),
-        Dataset::default()
-            .name("BE")
-            .marker(symbols::Marker::Block)
-            .graph_type(GraphType::Line)
-            .style(Style::default().fg(Color::Yellow))
-            .data(&data.breakeven_line),
-        Dataset::default()
-            .name("Target")
-            .marker(symbols::Marker::Block)
-            .graph_type(GraphType::Line)
-            .style(Style::default().fg(Color::Green))
-            .data(&data.target_line),
-        Dataset::default()
-            .name("TP")
-            .marker(symbols::Marker::Dot)
-            .graph_type(GraphType::Scatter)
-            .style(Style::default().fg(Color::Green))
-            .data(&data.target_point),
-        Dataset::default()
-            .name("TP stress")
-            .marker(symbols::Marker::Dot)
-            .graph_type(GraphType::Scatter)
-            .style(Style::default().fg(Color::Magenta).add_modifier(Modifier::BOLD))
-            .data(&data.stress_target_point),
-    ];
+            .style(Style::default().fg(Color::Green).add_modifier(Modifier::BOLD))
+            .data(&target_bar),
+    );
+    let mut be_bar = None;
+    if let Some(be_move) = data.breakeven_move_pct {
+        be_bar = Some(vertical_marker_line(be_move, data.y_bounds));
+    }
+    if let Some(points) = be_bar.as_ref() {
+        datasets.push(
+            Dataset::default()
+                .name("B breakeven")
+                .marker(symbols::Marker::Braille)
+                .graph_type(GraphType::Line)
+                .style(Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD))
+                .data(points),
+        );
+    }
+    let mut stop_bar = None;
+    if let Some(stop_move) = data.stop_move_pct {
+        stop_bar = Some(vertical_marker_line(stop_move, data.y_bounds));
+    }
+    if let Some(points) = stop_bar.as_ref() {
+        datasets.push(
+            Dataset::default()
+                .name("X stop")
+                .marker(symbols::Marker::Braille)
+                .graph_type(GraphType::Line)
+                .style(Style::default().fg(Color::Red).add_modifier(Modifier::BOLD))
+                .data(points),
+        );
+    }
+
     let chart = Chart::new(datasets)
         .block(
             Block::default()
                 .title(format!(
-                    " Plan {} | entree 0/0 | stop now {} | BE target {} | TP {:+.1}% ",
+                    " Plan {} | S 0/0 | X {} | B {} | T {} ",
                     candidate.symbol,
-                    title_stop,
+                    format_optional_signed_pct(data.stop_move_pct),
                     breakeven_move_cell(candidate, underlying.price),
-                    candidate.net_return_pct
+                    format_signed_pct(data.target_net_pct)
                 ))
                 .borders(Borders::ALL)
                 .border_style(Style::default().fg(Color::DarkGray)),
@@ -952,26 +956,29 @@ fn draw_payoff_chart(
         .x_axis(
             Axis::default()
                 .title("mouvement sous-jacent %")
-                .style(Style::default().fg(Color::Gray))
+                .style(Style::default().fg(Color::DarkGray))
                 .bounds(data.x_bounds)
                 .labels(vec![
                     Span::raw(format!("{:.0}", data.x_bounds[0])),
-                    Span::raw("0"),
+                    Span::styled("S", Style::default().fg(Color::White)),
                     Span::raw(format!("{:.0}", data.x_bounds[1])),
                 ]),
         )
         .y_axis(
             Axis::default()
                 .title("P/L net %")
-                .style(Style::default().fg(Color::Gray))
+                .style(Style::default().fg(Color::DarkGray))
                 .bounds(data.y_bounds)
                 .labels(vec![
                     Span::raw(format!("{:.0}", data.y_bounds[0])),
-                    Span::raw("0"),
+                    Span::styled("0", Style::default().fg(Color::White)),
                     Span::raw(format!("{:.0}", data.y_bounds[1])),
                 ]),
         );
-    frame.render_widget(chart, area);
+    frame.render_widget(
+        chart,
+        area,
+    );
 }
 
 fn visual_line_count(lines: &[Line], width: u16) -> usize {
@@ -990,14 +997,10 @@ fn visual_line_count(lines: &[Line], width: u16) -> usize {
 }
 
 struct PayoffChartData {
-    curve: Vec<(f64, f64)>,
-    entry_point: Vec<(f64, f64)>,
-    breakeven_line: Vec<(f64, f64)>,
-    target_line: Vec<(f64, f64)>,
-    target_point: Vec<(f64, f64)>,
-    stress_target_point: Vec<(f64, f64)>,
-    stop_line: Vec<(f64, f64)>,
-    stop_point: Vec<(f64, f64)>,
+    plan_line: Vec<(f64, f64)>,
+    target_move_pct: f64,
+    breakeven_move_pct: Option<f64>,
+    target_net_pct: f64,
     stop_move_pct: Option<f64>,
     stop_net_pct: Option<f64>,
     x_bounds: [f64; 2],
@@ -1015,7 +1018,7 @@ fn build_payoff_chart(
     if spot <= 0.0 || candidate.entry_price <= 0.0 || candidate.parity <= 0.0 {
         return None;
     }
-    let years_remaining = years_between(config.target_date, candidate.maturity)?;
+    years_between(config.target_date, candidate.maturity)?;
     let kind = option_kind(&candidate.side)?;
     let target_move = signed_move_pct(spot, config.target_price);
     let breakeven_move = candidate
@@ -1036,36 +1039,11 @@ fn build_payoff_chart(
         x_max += 5.0;
     }
 
-    let mut curve = Vec::with_capacity(61);
     let mut current_curve = Vec::with_capacity(61);
     let years_to_maturity = years_between(today, candidate.maturity)?;
     for index in 0..=60 {
         let move_pct = x_min + (x_max - x_min) * index as f64 / 60.0;
         let level = spot * (1.0 + move_pct / 100.0);
-        let target_dividend_pv = present_value_dividends(
-            config.target_date,
-            candidate.maturity,
-            config.risk_free_rate,
-            config,
-        );
-        let exit_price = scenario_price_at_level(
-            kind,
-            (level - target_dividend_pv).max(0.01),
-            candidate,
-            years_remaining,
-            config.risk_free_rate,
-            scenario_dividend_yield(config),
-            candidate.exit_volatility,
-            candidate.fx_exit_rate,
-        )?;
-        let exit_price = apply_exit_spread_penalty(
-            exit_price,
-            candidate.spread_pct,
-            candidate.effective_exit_spread_multiplier,
-        );
-        let net = net_return_after_fees(candidate.entry_price, exit_price, decision_config)?;
-        curve.push((move_pct, net));
-
         let current_dividend_pv =
             present_value_dividends(today, candidate.maturity, config.risk_free_rate, config);
         let current_exit_price = scenario_price_at_level(
@@ -1098,49 +1076,61 @@ fn build_payoff_chart(
     });
     let stop_loss_pct = -decision_config.max_loss_pct_per_trade.abs();
     let stop_move_pct = find_stop_move(&current_curve, kind, stop_loss_pct);
-    let mut y_min = curve
+    let plan_line = straight_plan_line(x_min, x_max, target_move, target_net);
+    let mut y_min = plan_line
         .iter()
         .map(|(_, y)| *y)
-        .fold(0.0_f64, |left, right| left.min(right));
-    let mut y_max = curve
+        .fold(0.0_f64, f64::min)
+        .min(stop_loss_pct);
+    let mut y_max = plan_line
         .iter()
         .map(|(_, y)| *y)
-        .fold(0.0_f64, |left, right| left.max(right));
-    y_min = y_min.min(target_net);
-    y_max = y_max.max(target_net);
-    if let Some(stressed) = stressed_target_net {
-        y_min = y_min.min(stressed);
-        y_max = y_max.max(stressed);
+        .fold(0.0_f64, f64::max)
+        .max(target_net);
+    if let Some(value) = stressed_target_net {
+        y_min = y_min.min(value);
+        y_max = y_max.max(value);
     }
-    y_min = y_min.min(stop_loss_pct);
-    y_max = y_max.max(0.0);
-    let y_padding = ((y_max - y_min).abs() * 0.12).max(5.0);
-    y_min -= y_padding;
+    let y_padding = ((y_max - y_min).abs() * 0.15).max(5.0);
+    y_min = (y_min - y_padding).max(-100.0);
     y_max += y_padding;
+    if y_max - y_min < 10.0 {
+        y_min -= 5.0;
+        y_max += 5.0;
+    }
 
-    let breakeven_x = breakeven_move.unwrap_or(0.0);
-    let stop_line = stop_move_pct
-        .map(|stop_x| vec![(stop_x, y_min), (stop_x, y_max)])
-        .unwrap_or_default();
-    let stop_point = stop_move_pct
-        .map(|stop_x| vec![(stop_x, stop_loss_pct)])
-        .unwrap_or_default();
     Some(PayoffChartData {
-        curve,
-        entry_point: vec![(0.0, 0.0)],
-        breakeven_line: vec![(breakeven_x, y_min), (breakeven_x, y_max)],
-        target_line: vec![(target_move, y_min), (target_move, y_max)],
-        target_point: vec![(target_move, target_net)],
-        stress_target_point: stressed_target_net
-            .map(|net| vec![(target_move, net)])
-            .unwrap_or_default(),
-        stop_line,
-        stop_point,
+        plan_line,
+        target_move_pct: target_move,
+        breakeven_move_pct: breakeven_move,
+        target_net_pct: target_net,
         stop_move_pct,
         stop_net_pct: stop_move_pct.map(|_| stop_loss_pct),
         x_bounds: [x_min, x_max],
         y_bounds: [y_min, y_max],
     })
+}
+
+fn straight_plan_line(x_min: f64, x_max: f64, target_move_pct: f64, target_net_pct: f64) -> Vec<(f64, f64)> {
+    if target_move_pct.abs() < f64::EPSILON {
+        return vec![(x_min, 0.0), (x_max, 0.0)];
+    }
+    let slope = target_net_pct / target_move_pct;
+    (0..=40)
+        .map(|index| {
+            let x = x_min + (x_max - x_min) * index as f64 / 40.0;
+            (x, slope * x)
+        })
+        .collect()
+}
+
+fn vertical_marker_line(x: f64, y_bounds: [f64; 2]) -> Vec<(f64, f64)> {
+    (0..=24)
+        .map(|index| {
+            let y = y_bounds[0] + (y_bounds[1] - y_bounds[0]) * index as f64 / 24.0;
+            (x, y)
+        })
+        .collect()
 }
 
 fn find_stop_move(curve: &[(f64, f64)], kind: OptionKind, stop_net_pct: f64) -> Option<f64> {
@@ -1365,12 +1355,12 @@ fn filter_candidates(
         .collect()
 }
 
-fn resolve_scenario_side(requested_side: &str, target_price: f64, spot: f64) -> &'static str {
+fn resolve_scenario_side(requested_side: &str, _target_price: f64, _spot: f64) -> &'static str {
     match requested_side {
-        "force-call" | "force-calls" => "call",
-        "force-put" | "force-puts" => "put",
-        _ if target_price >= spot => "call",
-        _ => "put",
+        "call" | "calls" | "force-call" | "force-calls" => "call",
+        "put" | "puts" | "force-put" | "force-puts" => "put",
+        "all" | "both" | "mixed" => "auto",
+        _ => "auto",
     }
 }
 
@@ -1601,7 +1591,15 @@ fn side_style(side: &str) -> Style {
     match side {
         "call" => Style::default().fg(Color::Green),
         "put" => Style::default().fg(Color::Red),
-        _ => Style::default().fg(Color::DarkGray),
+        _ => Style::default().fg(Color::Cyan),
+    }
+}
+
+fn side_label(side: &str) -> String {
+    match side {
+        "call" => "call".to_string(),
+        "put" => "put".to_string(),
+        _ => "auto calls+puts".to_string(),
     }
 }
 
@@ -1778,6 +1776,14 @@ fn format_compact_float(value: f64) -> String {
     }
 }
 
+fn format_contract_level(value: f64) -> String {
+    if value.fract().abs() < 0.005 {
+        format!("{value:.0}")
+    } else {
+        format!("{value:.2}")
+    }
+}
+
 fn format_optional_plain_pct(value: Option<f64>) -> String {
     value
         .map(|value| format!("{value:.2}%"))
@@ -1788,6 +1794,10 @@ fn format_optional_signed_pct(value: Option<f64>) -> String {
     value
         .map(|value| format!("{value:+.2}%"))
         .unwrap_or_else(|| "-".to_string())
+}
+
+fn format_signed_pct(value: f64) -> String {
+    format!("{value:+.2}%")
 }
 
 fn format_money_from_pct(pct: f64, notional: f64) -> String {
@@ -1868,6 +1878,9 @@ fn human_warnings(warnings: &[String]) -> String {
             "discrete_dividends_applied" => "dividendes discrets appliques dans le pricing de sortie",
             "dynamic_exit_spread_penalty" => {
                 "spread de sortie elargi car le delta projete est proche d'une zone extreme"
+            }
+            "opposite_side_scenario" => {
+                "side nominal oppose a la these, garde car le pricing projete reste analyse"
             }
             _ => "warning non documente",
         })

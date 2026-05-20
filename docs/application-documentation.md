@@ -318,43 +318,36 @@ Touches:
 
 Quand `m` est utilise, l'application recalcule:
 
-- la direction call/put si `SCENARIO_SIDE=auto`
+- les calls et les puts si `SCENARIO_SIDE=auto`
 - les prix projetes
 - les probabilites
 - les decisions
 - l'affichage
 
+`SCENARIO_SIDE=auto` ne deduit donc plus un seul cote a partir de la cible. Une these haussiere peut garder un put, et une these baissiere peut garder un call, si le pricing projete montre que le produit peut devenir rentable via l'IV, le theta restant ou la convexite. Les probabilites `Tch<=D` restent calculees dans la direction de la these de marche, pas dans le sens nominal du warrant.
+
 Colonnes utiles du mode scenario:
 
-- `Net`: rendement net projete apres frais au target
-- `P/L EUR`: gain/perte en euros pour `FEE_ORDER_NOTIONAL`
-- `Stress`: rendement net au target si l'IV baisse de `SCENARIO_VOL_SHOCK_POINTS`
-- `Str EUR`: gain/perte en euros du scenario stresse pour `FEE_ORDER_NOTIONAL`
+- `Net@D`: rendement net projete a la date cible, apres frais broker et spread de sortie estime
+- `P/L@D`: gain/perte en euros a la date cible pour `FEE_ORDER_NOTIONAL`
+- `Str@D`: rendement net a la date cible si l'IV baisse de `SCENARIO_VOL_SHOCK_POINTS`
 - `BE mv`: mouvement minimum du sous-jacent pour atteindre le point mort
-- `PBE`: probabilite d'atteindre le point mort
-- `PTgt`: probabilite d'atteindre la cible
-- `EV`: esperance risk-neutral
-- `Kelly`: Kelly binaire au target
+- `Tch<=D`: probabilite first-touch d'atteindre la cible avant ou a la date scenario
+- `EntryAsk`: prix d'entree acheteur utilise
+- `ExitBid@D`: prix de sortie bid estime a la date cible, hors frais broker
+- `Strike`, `Maturite`, `Par`: caracteristiques du contrat a verifier avant toute decision
 
-Quand l'ecran est assez large, le panneau Notes affiche aussi un graphique Ratatui de rentabilite:
+Quand l'ecran est assez large, le panneau Notes affiche aussi une droite de decision:
 
-- axe X: mouvement du sous-jacent en %
-- axe Y: P/L net du produit en %
-- point blanc: entree actuelle, normalisee a `0%` de mouvement et `0%` de P/L
-- courbe cyan: rendement net projete a la date cible selon le niveau du sous-jacent
-- ligne rouge: stop loss theorique mark-to-market, calcule avec `DECISION_MAX_LOSS_PCT_PER_TRADE`
-- ligne jaune: point mort a la date cible, niveau a partir duquel le trade devient rentable apres frais
-- ligne/point vert: target/TP du scenario, avec rendement net apres frais
-- point magenta: target/TP avec stress de volatilite implicite
+- axe: mouvement du sous-jacent en % depuis le spot courant
+- `S`: spot actuel, point d'entree normalise a `0%`
+- `X`: stop loss theorique mark-to-market, calcule avec `DECISION_MAX_LOSS_PCT_PER_TRADE`
+- `B`: point mort a la date cible, niveau a partir duquel le trade devient rentable apres frais
+- `T`: target/TP du scenario, avec rendement net apres frais
 
-Le graphe n'est pas une prediction du chemin du prix. Il sert a lire le plan:
+La droite n'est pas une prediction du chemin du prix. Elle sert a lire l'ordre des seuils: stop, spot, breakeven et target. Elle permet de voir tout de suite si le target est avant ou apres le point mort.
 
-- acheter au point blanc si le produit reste executable
-- couper si le sous-jacent arrive sur la ligne rouge, car le produit atteindrait environ la perte maximale configuree maintenant
-- considerer le trade rentable apres la ligne jaune uniquement pour la date cible affichee
-- prendre le gain du scenario sur la ligne verte
-
-Le point mort jaune est calcule avec Black-Scholes a la date cible:
+Le point mort `B` est calcule avec Black-Scholes a la date cible:
 
 ```text
 net_return(BlackScholes(S_BE, K, T_target_to_maturity, r, q, vol) / parite * fx) = 0

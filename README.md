@@ -13,9 +13,10 @@ Outil Rust/Docker pour decouvrir, parser et analyser des warrants, turbos et pro
 - Nettoyage de donnees: rejet des prix non executables, ask/bid a zero, prix stale, spreads aberrants et incoherences de devise.
 - Analyse `opportunities`: detection de decorellations relatives entre produits comparables.
 - Mode `scenario`: recherche des meilleurs warrants pour une these humaine, par exemple "AAPL a 330 USD fin octobre 2026".
+- En mode `SCENARIO_SIDE=auto`, les calls et les puts sont tous recalcules: un produit nominalement oppose a la these peut donc apparaitre si son prix projete devient interessant via IV, theta ou convexite.
 - Pricing Black-Scholes, IV, greeks, theta, stress de volatilite, stress FX, dividendes discrets et penalite de spread de sortie.
 - Caches locaux pour les bougies et les audits LLM afin d'eviter de consommer trop de credits API.
-- Interface terminal Ratatui avec tableau, notes, graphique de P/L et onglet Gemini.
+- Interface terminal Ratatui avec tableau, notes, droite de decision et onglet Gemini.
 
 ## Installation
 
@@ -112,21 +113,25 @@ Dans le mode `scenario`:
 
 Les colonnes principales:
 
-- `Net`: rendement net projete au target apres frais et spread de sortie estime.
-- `P/L EUR`: gain ou perte estimee pour `FEE_ORDER_NOTIONAL`.
-- `Stress`: rendement net avec stress de volatilite implicite.
+- `Net@D`: rendement net projete a la date cible, apres frais et spread de sortie estime.
+- `P/L@D`: gain ou perte estimee a la date cible pour `FEE_ORDER_NOTIONAL`.
+- `Str@D`: rendement net a la date cible avec stress de volatilite implicite.
 - `BE mv`: mouvement minimum du sous-jacent pour atteindre le point mort.
-- `TchT`: probabilite first-touch d'atteindre la cible avant la date scenario.
+- `Tch<=D`: probabilite first-touch d'atteindre la cible avant ou a la date scenario.
 - `Spr`: spread courant.
+- `EntryAsk`: prix d'entree acheteur utilise.
+- `ExitBid@D`: prix de sortie bid estime a la date cible, hors frais broker.
 - `IVout`: volatilite utilisee a la sortie apres ajustement dynamique.
 - `DQ`: qualite des donnees.
 
-Le graphique affiche la courbe de P/L net a la date cible selon le mouvement du sous-jacent:
+La droite de decision place les niveaux importants sur un seul axe de mouvement du sous-jacent:
 
-- point d'entree: position actuelle
-- ligne de stop: zone ou le produit atteint la perte maximale configuree
-- point mort: niveau ou le trade n'est plus perdant apres frais
-- target: sortie theorique du scenario
+- `S`: spot actuel, point d'entree normalise a 0%
+- `X`: stop mark-to-market, zone ou le produit atteint la perte maximale configuree
+- `B`: breakeven, niveau ou le trade n'est plus perdant apres frais
+- `T`: target, sortie theorique du scenario
+
+Cette representation est volontairement une droite, pas une courbe de prix: elle ne montre pas une prediction du marche, seulement l'ordre des seuils utiles pour decider.
 
 ## Configuration Importante
 
@@ -152,6 +157,8 @@ GEMINI_API_KEY=gemini_key_1,gemini_key_2
 GEMINI_MODEL=gemini-3-pro-preview
 LLM_CACHE=1
 ```
+
+`SCENARIO_SIDE=auto` est le mode recommande: il ne force plus uniquement `call` quand la cible est au-dessus du spot ou `put` quand elle est en-dessous. Le moteur calcule les deux cotes et classe ensuite les produits selon le P/L projete. Utilise `call` ou `put` seulement si tu veux volontairement exclure l'autre cote.
 
 `GEMINI_API_KEY`, `ORATS_API_KEY` et `POLYGON_API_KEY` acceptent plusieurs cles separees par des virgules. Si une cle echoue ou est rate-limitee, l'application essaie la suivante.
 
