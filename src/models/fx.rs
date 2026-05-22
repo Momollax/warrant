@@ -103,4 +103,27 @@ mod tests {
         assert!(book.is_empty());
         assert_eq!(book.convert(100.0, "USD", "EUR"), None);
     }
+
+    #[test]
+    fn currency_codes_are_case_insensitive() {
+        let mut book = FxRateBook::default();
+        book.add(FxRate {
+            from: "usd".to_string(),
+            to: "eur".to_string(),
+            rate: 0.86,
+            source_ticker: "EURUSD=X".to_string(),
+        });
+
+        assert_eq!(book.rate("USD", "eur"), Some(0.86));
+        assert_close(book.convert(86.0, "EUR", "usd").unwrap(), 100.0, 1e-10);
+        assert_eq!(book.source_ticker("Usd", "EUR"), Some("EURUSD=X"));
+        assert_eq!(book.source_ticker("eur", "EUR"), Some("IDENTITY"));
+    }
+
+    fn assert_close(actual: f64, expected: f64, tolerance: f64) {
+        assert!(
+            (actual - expected).abs() <= tolerance,
+            "actual={actual}, expected={expected}, tolerance={tolerance}"
+        );
+    }
 }

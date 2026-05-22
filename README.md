@@ -13,7 +13,7 @@ Outil Rust/Docker pour decouvrir, parser et analyser des warrants, turbos et pro
 - Nettoyage de donnees: rejet des prix non executables, ask/bid a zero, prix stale, spreads aberrants et incoherences de devise.
 - Analyse `opportunities`: detection de decorellations relatives entre produits comparables.
 - Mode `scenario`: recherche des meilleurs produits pour une these humaine, par exemple "AAPL a 330 USD fin octobre 2026".
-- En mode `SCENARIO_SIDE=auto`, les calls et les puts sont tous recalcules: un produit nominalement oppose a la these peut donc apparaitre si son prix projete devient interessant via IV, theta ou convexite.
+- En mode `SCENARIO_SIDE=auto`, le moteur suit la these: calls pour une cible au-dessus du spot, puts/shorts pour une cible sous le spot. `mixed`/`all` sert a auditer les deux cotes volontairement.
 - Pricing Black-Scholes pour warrants vanilla; projection lineaire intrinsic/parite/FX pour turbos, mini-futures et knock-out compatibles.
 - IV, greeks, theta, stress de volatilite, stress FX, dividendes discrets et penalite de spread de sortie quand le modele du produit le permet.
 - Caches locaux pour les bougies et les audits LLM afin d'eviter de consommer trop de credits API.
@@ -73,6 +73,14 @@ LLM_ENABLE=1 \
 ./manage.sh scenario apple AAPL 330 2026-10-31 2027-01-01 2027-03-31 auto 500
 ```
 
+Le target peut aussi etre une zone si tu ne veux pas figer un prix exact:
+
+```bash
+./manage.sh scenario apple AAPL 365..375 2026-10-31 2027-01-01 2028-12-31 auto 500
+```
+
+Dans ce cas, le moteur valorise le bas, le milieu et le haut de la zone. Par defaut, `Net@D` et la decision restent bases sur le milieu de zone pour conserver le comportement du target unique; le panneau Notes affiche min/moy/max. Mets `SCENARIO_RANGE_DECISION_MODE=avg` ou `worst` si tu veux que la range influence vraiment le score et les decisions.
+
 Lancer un scenario Hermes:
 
 ```bash
@@ -97,6 +105,10 @@ Tests:
 ./manage.sh test-unit
 ```
 
+Documentation d'audit des formules et controles de donnees:
+
+- [Calculs et audit des donnees](docs/calculations-and-data-audit.md)
+
 ## Interface
 
 Dans le mode `scenario`:
@@ -114,13 +126,13 @@ Dans le mode `scenario`:
 
 Les colonnes principales:
 
-- `Net@D`: rendement net projete a la date cible, apres frais et spread de sortie estime.
-- `P/L@D`: gain ou perte estimee a la date cible pour `FEE_ORDER_NOTIONAL`.
-- `Str@D`: rendement net a la date cible avec stress de volatilite implicite.
+- `Net@D`: rendement net projete a la date cible, apres frais et spread de sortie estime. Avec une range, c'est le milieu de zone par defaut.
+- `P/L@D`: gain ou perte estimee a la date cible pour `FEE_ORDER_NOTIONAL`. Avec une range, c'est le milieu de zone par defaut.
+- `Str@D`: rendement net a la date cible avec stress de volatilite implicite. Avec une range, c'est le pire stress de la zone.
 - `BE mv`: mouvement minimum du sous-jacent pour atteindre le point mort.
 - `Tch<=D`: probabilite first-touch d'atteindre la cible avant ou a la date scenario.
 - `KO%`: probabilite first-touch de barriere/knock-out avant la date cible, si barriere connue.
-- `MCev`: esperance de rendement issue de la simulation Monte Carlo target/stop/KO.
+- `MCev`: moyenne des rendements simules Monte Carlo avec target, stop mark-to-market et KO.
 - `Spr`: spread courant.
 - `Type`: famille du produit (`Warrant`, `Turbo`, `MiniF`, `KO-fin`, `KO-bar`).
 - `EntryAsk`: prix d'entree acheteur utilise.
@@ -167,7 +179,7 @@ GEMINI_MODEL=gemini-3-pro-preview
 LLM_CACHE=1
 ```
 
-`SCENARIO_SIDE=auto` est le mode recommande: il ne force plus uniquement `call` quand la cible est au-dessus du spot ou `put` quand elle est en-dessous. Le moteur calcule les deux cotes et classe ensuite les produits selon le P/L projete. Utilise `call` ou `put` seulement si tu veux volontairement exclure l'autre cote.
+`SCENARIO_SIDE=auto` est le mode recommande: il suit la direction de la these. Si la cible est au-dessus du spot, il garde les produits haussiers; si la cible est sous le spot, il garde les produits baissiers. Utilise `mixed`/`all` ou `SCENARIO_ALLOW_OPPOSITE_SIDE=1` seulement si tu veux volontairement analyser aussi les produits inverses.
 
 `GEMINI_API_KEY`, `ORATS_API_KEY` et `POLYGON_API_KEY` acceptent plusieurs cles separees par des virgules. Si une cle echoue ou est rate-limitee, l'application essaie la suivante.
 

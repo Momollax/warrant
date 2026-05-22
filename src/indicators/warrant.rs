@@ -1098,6 +1098,43 @@ mod tests {
     }
 
     #[test]
+    fn orderbook_sanity_rejects_inverted_missing_or_too_wide_quotes() {
+        assert!(sane_orderbook_quote(Some(1.00), 1.01));
+        assert!(!sane_orderbook_quote(None, 1.01));
+        assert!(!sane_orderbook_quote(Some(0.0), 1.01));
+        assert!(!sane_orderbook_quote(Some(1.02), 1.01));
+        assert!(!sane_orderbook_quote(Some(1.00), 2.00));
+    }
+
+    #[test]
+    fn data_quality_penalizes_last_price_and_missing_spread() {
+        let executable = QuotePrice {
+            value: 1.01,
+            currency: Some("EUR".to_string()),
+            source: "boursorama_ask",
+            bid: Some(1.00),
+            ask: Some(1.01),
+            bid_size: Some(100.0),
+            ask_size: Some(100.0),
+            volume: Some(10.0),
+        };
+        let unverified = QuotePrice {
+            value: 1.01,
+            currency: Some("EUR".to_string()),
+            source: "last_unverified",
+            bid: None,
+            ask: None,
+            bid_size: None,
+            ask_size: None,
+            volume: None,
+        };
+
+        assert_eq!(data_quality_score(&executable, Some(0.995)), 100.0);
+        assert!(data_quality_score(&executable, None) < 100.0);
+        assert!(data_quality_score(&unverified, None) <= 10.0);
+    }
+
+    #[test]
     fn explicit_zero_ask_does_not_fallback_to_last_price() {
         let product = StructuredProduct {
             bid_ask: "3,620 / 0,000  EUR".to_string(),

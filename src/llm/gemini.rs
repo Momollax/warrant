@@ -188,6 +188,8 @@ pub fn build_scenario_prompt(
         "scenario": {
             "side": scenario.side,
             "target_price": scenario.target_price,
+            "target_price_min": scenario.target_price_min,
+            "target_price_max": scenario.target_price_max,
             "target_date": scenario.target_date.to_string(),
             "min_maturity": scenario.min_maturity.map(|date| date.to_string()),
             "max_maturity": scenario.max_maturity.map(|date| date.to_string()),
@@ -275,6 +277,14 @@ pub fn build_scenario_prompt(
                 "p50_return_pct": candidate.monte_carlo_p50_return_pct,
                 "p95_return_pct": candidate.monte_carlo_p95_return_pct
             },
+            "target_range": {
+                "low": candidate.target_range_low,
+                "high": candidate.target_range_high,
+                "net_min_pct": candidate.target_range_net_min_pct,
+                "net_avg_pct": candidate.target_range_net_avg_pct,
+                "net_max_pct": candidate.target_range_net_max_pct,
+                "stress_min_pct": candidate.target_range_stress_min_pct
+            },
             "linear_model_note": if candidate.pricing_model == "warrant_intrinsic" {
                 Value::Null
             } else {
@@ -306,7 +316,7 @@ fn gemini_system_instruction() -> &'static str {
      3. Ne considere jamais flow_score_informational_only comme une raison de BUY/WATCH/AVOID. Le flux/volume est informatif seulement; les vrais criteres d'execution sont bid/ask, spread, tailles, statut et fraicheur des donnees.\n\
      4. Distingue probabilite first-touch monde reel et probabilite terminale risque-neutre. Ne presente pas le Kelly comme une certitude.\n\
      5. Sois concis: max 2 phrases pour summary, 3 a 5 items par liste, pas de conseil financier direct.\n\
-     6. Favorise WATCH/AVOID si donnees manquantes, spread large, EV/Kelly faibles ou negatifs, risque FX/IV fort, stale pricing, prix non executable ou target avant breakeven.\n\
+     6. Favorise WATCH/AVOID si donnees manquantes, spread large, fair-value Q/Kelly faibles ou negatifs, risque FX/IV fort, stale pricing, prix non executable ou target avant breakeven.\n\
      7. Pour les produits lineaires open-end, ne traite pas IV/theta/vega comme des criteres Black-Scholes. Si linear_model_note indique que le financement futur n'est pas projete sur un horizon long, cite ce point comme limite du signal plutot qu'un probleme de liquidite."
 }
 
@@ -653,6 +663,8 @@ Fin."#,
     fn scenario() -> ScenarioConfig {
         ScenarioConfig {
             target_price: 330.0,
+            target_price_min: None,
+            target_price_max: None,
             target_date: NaiveDate::from_ymd_opt(2026, 10, 31).unwrap(),
             min_maturity: Some(NaiveDate::from_ymd_opt(2027, 1, 1).unwrap()),
             max_maturity: Some(NaiveDate::from_ymd_opt(2027, 3, 31).unwrap()),
@@ -747,6 +759,12 @@ Fin."#,
             monte_carlo_p05_return_pct: Some(-25.0),
             monte_carlo_p50_return_pct: Some(-3.0),
             monte_carlo_p95_return_pct: Some(42.0),
+            target_range_low: None,
+            target_range_high: None,
+            target_range_net_min_pct: None,
+            target_range_net_avg_pct: None,
+            target_range_net_max_pct: None,
+            target_range_stress_min_pct: None,
             reasons: vec![],
             warnings: vec![],
         }

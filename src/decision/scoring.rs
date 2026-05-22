@@ -29,7 +29,7 @@ pub fn compute_confidence_score(
         + edge_score * 0.15
         + reward_risk_score * 0.10
         + barrier_score * 0.05
-        + time_score * 0.05
+        + time_score * 0.10
 }
 
 pub fn decide_action(
@@ -127,6 +127,23 @@ mod tests {
         assert_eq!(decision, DecisionAction::BuyCandidate);
         assert!(reasons.contains(&"entry_conditions_met".to_string()));
         assert!(warnings.is_empty());
+    }
+
+    #[test]
+    fn perfect_inputs_can_reach_full_confidence_score() {
+        let signal = signal(10.0, Some(0.0), 100.0, 70.0, 10, Some(100.0));
+        let mut plan = plan();
+        plan.reward_risk_2 = Some(100.0);
+        plan.horizon.time_risk_score = 100.0;
+
+        let score = compute_confidence_score(
+            &signal,
+            plan.reward_risk_2,
+            plan.horizon.time_risk_score,
+            &DecisionConfig::default(),
+        );
+
+        assert_close(score, 100.0, 1e-9);
     }
 
     #[test]
@@ -354,5 +371,12 @@ mod tests {
             },
             confidence_score: 0.0,
         }
+    }
+
+    fn assert_close(actual: f64, expected: f64, tolerance: f64) {
+        assert!(
+            (actual - expected).abs() <= tolerance,
+            "actual={actual}, expected={expected}, tolerance={tolerance}"
+        );
     }
 }

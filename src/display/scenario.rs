@@ -92,11 +92,13 @@ pub fn run(
                 if let Some(input) = target_edit.as_mut() {
                     match key.code {
                         KeyCode::Enter => {
-                            let parsed = input.replace(',', ".").parse::<f64>();
+                            let parsed = parse_target_edit(input);
                             match parsed {
-                                Ok(target) if target > 0.0 => {
+                                Some((target, min, max)) if target > 0.0 => {
                                     drop(visible);
                                     config.target_price = target;
+                                    config.target_price_min = min;
+                                    config.target_price_max = max;
                                     config.side = resolve_scenario_side(
                                         requested_side,
                                         config.target_price,
@@ -116,8 +118,8 @@ pub fn run(
                                     detail_tab = DetailTab::Notes;
                                     llm_reviews.clear();
                                     status_message = format!(
-                                        "Cible modifiee a {:.4}; scenario recalcule en {} avec {} candidat(s).",
-                                        config.target_price,
+                                        "Cible modifiee a {}; scenario recalcule en {} avec {} candidat(s).",
+                                        scenario_target_label(&config, underlying.price),
                                         config.side,
                                         candidates.len()
                                     );
@@ -126,7 +128,7 @@ pub fn run(
                                 }
                                 _ => {
                                     status_message =
-                                        format!("Cible invalide: '{input}'. Exemple: 1300 ou 1700.5");
+                                        format!("Cible invalide: '{input}'. Exemple: 1300, 1700.5 ou 365..375");
                                     target_edit = None;
                                     continue;
                                 }
@@ -142,7 +144,7 @@ pub fn run(
                             continue;
                         }
                         KeyCode::Char(ch)
-                            if ch.is_ascii_digit() || matches!(ch, '.' | ',' | '_') =>
+                            if ch.is_ascii_digit() || matches!(ch, '.' | ',' | '_' | ':' | ';') =>
                         {
                             if ch != '_' {
                                 input.push(ch);
@@ -156,10 +158,14 @@ pub fn run(
                 match key.code {
                     KeyCode::Char('q') | KeyCode::Esc => break Ok(()),
                     KeyCode::Char('m') => {
-                        target_edit = Some(format_compact_float(config.target_price));
-                        status_message =
-                            "Edition cible: tape la nouvelle valeur, Enter valide, Esc annule."
-                                .to_string();
+                        target_edit = Some(match (config.target_price_min, config.target_price_max) {
+                            (Some(low), Some(high)) if high > low => {
+                                format!("{}..{}", format_compact_float(low), format_compact_float(high))
+                            }
+                            _ => format_compact_float(config.target_price),
+                        });
+                        status_message = "Edition cible: tape une valeur ou une range 365..375, Enter valide, Esc annule."
+                            .to_string();
                     }
                     KeyCode::Char('l') => {
                         detail_tab = detail_tab.toggle();
@@ -366,6 +372,7 @@ fn draw_header(
     } else {
         0.0
     };
+    let target_text = scenario_target_label(config, underlying.price);
 
     let lines = vec![
         Line::from(vec![
@@ -386,12 +393,7 @@ fn draw_header(
             Span::styled(
                 target_edit
                     .map(|value| format!("edition {value}_ au {}", config.target_date))
-                    .unwrap_or_else(|| {
-                        format!(
-                            "{:.4} au {} ({:+.2}%)",
-                            config.target_price, config.target_date, target_move
-                        )
-                    }),
+                    .unwrap_or_else(|| format!("{target_text} au {} ({:+.2}%)", config.target_date, target_move)),
                 target_edit
                     .map(|_| Style::default().fg(Color::Magenta).add_modifier(Modifier::BOLD))
                     .unwrap_or_else(|| target_style(target_move)),
@@ -399,7 +401,10 @@ fn draw_header(
         ]),
         Line::from(vec![
             Span::styled("These ", Style::default().fg(Color::DarkGray)),
-            Span::styled(side_label(&config.side), side_style(&config.side)),
+            Span::styled(
+                side_label(config, underlying.price),
+                side_style(&config.side),
+            ),
             Span::raw("  "),
             Span::styled("Maturite ", Style::default().fg(Color::DarkGray)),
             Span::styled(maturity, Style::default().fg(Color::White)),
@@ -482,18 +487,22 @@ fn draw_table(
     .bottom_margin(1);
 
     let rows = candidates.iter().map(|candidate| {
+        let displayed_net_pct = scenario_display_net_pct(candidate);
+        let displayed_stress_pct = candidate
+            .target_range_stress_min_pct
+            .or(candidate.stressed_net_return_pct);
         Row::new(vec![
             Cell::from(candidate.decision).style(decision_style(candidate.decision)),
             Cell::from(format!("{:.0}", candidate.score)).style(score_style(candidate.score)),
-            Cell::from(format!("{:+.1}%", candidate.net_return_pct))
-                .style(return_style(candidate.net_return_pct)),
+            Cell::from(format!("{:+.1}%", displayed_net_pct))
+                .style(return_style(displayed_net_pct)),
             Cell::from(format_money_table_from_pct(
-                candidate.net_return_pct,
+                displayed_net_pct,
                 decision_config.fee_order_notional,
             ))
-            .style(return_style(candidate.net_return_pct)),
-            Cell::from(format_optional_signed_pct(candidate.stressed_net_return_pct))
-                .style(optional_return_style(candidate.stressed_net_return_pct)),
+            .style(return_style(displayed_net_pct)),
+            Cell::from(format_optional_signed_pct(displayed_stress_pct))
+                .style(optional_return_style(displayed_stress_pct)),
             Cell::from(breakeven_move_cell(candidate, underlying.price))
                 .style(breakeven_move_style(candidate, underlying.price)),
             Cell::from(format_optional_plain_pct(candidate.probability_target_pct)),
@@ -595,9 +604,9 @@ fn draw_details(
                 Line::from(vec![
                     Span::styled("These ", Style::default().fg(Color::Yellow)),
                     Span::raw(format!(
-                        "{} target {:.4} au {}, strike {:.4}, maturite {}",
+                        "{} target {} au {}, strike {:.4}, maturite {}",
                         candidate.side,
-                        config.target_price,
+                        scenario_target_label(config, underlying.price),
                         config.target_date,
                         candidate.strike,
                         candidate.maturity_label
@@ -620,6 +629,10 @@ fn draw_details(
                     )),
                 ]),
                 stress_line(candidate, decision_config),
+                Line::from(vec![
+                    Span::styled("Range cible ", Style::default().fg(Color::Yellow)),
+                    Span::raw(target_range_sentence(candidate, decision_config)),
+                ]),
                 Line::from(vec![
                     Span::styled("Montant ", Style::default().fg(Color::Yellow)),
                     Span::raw(money_plan_sentence(candidate, underlying, config, decision_config, today)),
@@ -653,7 +666,7 @@ fn draw_details(
                 Line::from(vec![
                     Span::styled("Stats ordre ", Style::default().fg(Color::Yellow)),
                     Span::raw(format!(
-                        "EV risk-neutral {}  Sharpe-like TP/SL {}  Kelly TP/SL borne {}",
+                        "Fair-value Q {}  Sharpe-like TP/SL {}  Kelly TP/SL borne {}",
                         format_optional_signed_pct(candidate.expected_value_pct),
                         format_optional_fixed(candidate.sharpe_like, 3),
                         format_optional_plain_pct(candidate.kelly_fraction_pct)
@@ -766,19 +779,13 @@ fn draw_details(
                     format_optional_plain_pct(candidate.terminal_probability_breakeven_pct)
                 )),
                 Line::from(format!(
-                    "Calc stats: EV=risk-neutral model value at horizon vs entry; Kelly TP/SL=max(0,(b*p-q)/b), b=gain_target/stop_loss, p=FirstTouch target, q=1-p; p requis {}",
+                    "Calc stats: Fair-value Q=valeur modele risk-neutral portee a l'horizon vs entree; ce n'est pas une vraie EV monde reel. Kelly TP/SL=max(0,(b*p-q)/b), b=gain_target/stop_loss, p=FirstTouch target, q=1-p; p requis {}",
                     kelly_required_probability(candidate, decision_config)
                 )),
             ]
         })
         .unwrap_or_else(|| {
-            vec![
-                Line::from("Aucun warrant ne correspond au scenario avec ce filtre."),
-                Line::from(
-                    "Essaie d'elargir la maturite, d'augmenter la limite, ou de verifier que Boursorama renvoie un bid/ask executable.",
-                ),
-                Line::from(status_message.to_string()),
-            ]
+            no_candidate_lines(config, underlying, status_message)
         })
     };
 
@@ -1335,7 +1342,7 @@ fn resolve_scenario_side(requested_side: &str, _target_price: f64, _spot: f64) -
     match requested_side {
         "call" | "calls" | "force-call" | "force-calls" => "call",
         "put" | "puts" | "force-put" | "force-puts" => "put",
-        "all" | "both" | "mixed" => "auto",
+        "all" | "both" | "mixed" => "mixed",
         _ => "auto",
     }
 }
@@ -1571,12 +1578,74 @@ fn side_style(side: &str) -> Style {
     }
 }
 
-fn side_label(side: &str) -> String {
-    match side {
+fn side_label(config: &ScenarioConfig, spot: f64) -> String {
+    match config.side.as_str() {
         "call" => "call".to_string(),
         "put" => "put".to_string(),
-        _ => "auto calls+puts".to_string(),
+        "mixed" | "all" | "both" => "mixed calls+puts".to_string(),
+        "auto" => match thesis_direction(config, spot) {
+            Some("up") => "auto hausse".to_string(),
+            Some("down") => "auto baisse".to_string(),
+            _ => "auto directionnel".to_string(),
+        },
+        _ => "auto directionnel".to_string(),
     }
+}
+
+fn thesis_direction(config: &ScenarioConfig, spot: f64) -> Option<&'static str> {
+    let target = scenario_success_level(config, spot);
+    if target > spot {
+        Some("up")
+    } else if target < spot {
+        Some("down")
+    } else {
+        None
+    }
+}
+
+fn scenario_success_level(config: &ScenarioConfig, spot: f64) -> f64 {
+    match (config.target_price_min, config.target_price_max) {
+        (Some(low), Some(high)) if high > low && config.target_price >= spot => low,
+        (Some(low), Some(high)) if high > low && config.target_price < spot => high,
+        _ => config.target_price,
+    }
+}
+
+fn no_candidate_lines(
+    config: &ScenarioConfig,
+    underlying: &WarrantSnapshot,
+    status_message: &str,
+) -> Vec<Line<'static>> {
+    let mut lines = vec![Line::from(
+        "Aucun produit ne correspond au scenario avec ce filtre.",
+    )];
+    if config.side == "auto" {
+        let direction = match thesis_direction(config, underlying.price) {
+            Some("up") => "hausse",
+            Some("down") => "baisse",
+            _ => "neutre",
+        };
+        let kept = match direction {
+            "hausse" => "produits haussiers: calls, turbos/mini-futures longs",
+            "baisse" => "produits baissiers: puts, turbos/mini-futures shorts",
+            _ => "produits coherents avec la direction",
+        };
+        lines.push(Line::from(format!(
+            "Mode auto directionnel: cible {direction}; le moteur garde seulement les {kept}."
+        )));
+        lines.push(Line::from(
+            "Ici, les produits recuperes ne contiennent probablement aucun produit de ce cote avec bid/ask executable.",
+        ));
+        lines.push(Line::from(
+            "Pour auditer ce que Boursorama renvoie quand meme, relance avec le cote mixed/all ou SCENARIO_ALLOW_OPPOSITE_SIDE=1.",
+        ));
+    } else {
+        lines.push(Line::from(
+            "Essaie d'elargir la maturite, d'augmenter la limite, ou de verifier que Boursorama renvoie un bid/ask executable.",
+        ));
+    }
+    lines.push(Line::from(status_message.to_string()));
+    lines
 }
 
 fn product_kind_label(candidate: &ScenarioCandidate) -> &'static str {
@@ -1731,7 +1800,7 @@ fn money_plan_sentence(
     today: NaiveDate,
 ) -> String {
     let notional = decision_config.fee_order_notional;
-    let target = format_money_from_pct(candidate.net_return_pct, notional);
+    let target = format_money_from_pct(scenario_display_net_pct(candidate), notional);
     let stress = if is_linear_product(candidate) {
         "n/a".to_string()
     } else {
@@ -1744,6 +1813,70 @@ fn money_plan_sentence(
     format!(
         "pour {:.2} EUR engages: target {}, stress IV {}, stop {}. Au point mort, le P/L net estime est proche de 0 EUR apres frais.",
         notional, target, stress, stop
+    )
+}
+
+fn scenario_display_net_pct(candidate: &ScenarioCandidate) -> f64 {
+    candidate.net_return_pct
+}
+
+fn scenario_target_label(config: &ScenarioConfig, spot: f64) -> String {
+    match (config.target_price_min, config.target_price_max) {
+        (Some(low), Some(high)) if high > low => {
+            let low_move = signed_move_pct(spot, low);
+            let high_move = signed_move_pct(spot, high);
+            format!(
+                "{:.4}..{:.4} (mid {:.4}, {:+.2}%..{:+.2}%)",
+                low, high, config.target_price, low_move, high_move
+            )
+        }
+        _ => format!("{:.4}", config.target_price),
+    }
+}
+
+fn parse_target_edit(input: &str) -> Option<(f64, Option<f64>, Option<f64>)> {
+    let normalized = input.replace(',', ".");
+    let value = normalized.trim();
+    for separator in ["..", ":", ";"] {
+        if let Some((left, right)) = value.split_once(separator) {
+            let a = left.trim().parse::<f64>().ok()?;
+            let b = right.trim().parse::<f64>().ok()?;
+            if a <= 0.0 || b <= 0.0 || !a.is_finite() || !b.is_finite() {
+                return None;
+            }
+            let low = a.min(b);
+            let high = a.max(b);
+            return Some(((low + high) / 2.0, Some(low), Some(high)));
+        }
+    }
+    let target = value.parse::<f64>().ok()?;
+    (target > 0.0 && target.is_finite()).then_some((target, None, None))
+}
+
+fn target_range_sentence(
+    candidate: &ScenarioCandidate,
+    decision_config: &DecisionConfig,
+) -> String {
+    let (Some(low), Some(high), Some(min), Some(avg), Some(max)) = (
+        candidate.target_range_low,
+        candidate.target_range_high,
+        candidate.target_range_net_min_pct,
+        candidate.target_range_net_avg_pct,
+        candidate.target_range_net_max_pct,
+    ) else {
+        return "cible unique: pas de range configuree.".to_string();
+    };
+    format!(
+        "range {:.4}..{:.4}: net min/moy/max {:+.2}% / {:+.2}% / {:+.2}% ({} / {} / {}); stress min {}. Par defaut, decision et tri restent bases sur le mid target pour eviter les regressions; mets SCENARIO_RANGE_DECISION_MODE=avg ou worst pour optimiser sur la zone.",
+        low,
+        high,
+        min,
+        avg,
+        max,
+        format_money_from_pct(min, decision_config.fee_order_notional),
+        format_money_from_pct(avg, decision_config.fee_order_notional),
+        format_money_from_pct(max, decision_config.fee_order_notional),
+        format_optional_signed_pct(candidate.target_range_stress_min_pct)
     )
 }
 
@@ -1836,7 +1969,7 @@ fn financing_and_barrier_sentence(candidate: &ScenarioCandidate) -> String {
 
 fn monte_carlo_sentence(candidate: &ScenarioCandidate) -> String {
     format!(
-        "T avant S/KO {}  Stop avant T {}  KO {}  EV {}  P/L p05/p50/p95 {}/{}/{}",
+        "T avant SL/KO {}  SL MTM avant T {}  KO {}  MCev {}  P/L p05/p50/p95 {}/{}/{}",
         format_optional_plain_pct(candidate.monte_carlo_target_first_pct),
         format_optional_plain_pct(candidate.monte_carlo_stop_first_pct),
         format_optional_plain_pct(candidate.monte_carlo_ko_pct),
@@ -1962,6 +2095,9 @@ fn human_reasons(reasons: &[String]) -> String {
         .iter()
         .map(|reason| match reason.as_str() {
             "scenario_return_negative" => "rendement net negatif au target",
+            "target_range_has_negative_edge" => {
+                "range cible fragile: une partie de la zone donne un rendement net negatif"
+            }
             "entry_price_not_executable" => "prix d'entree non executable: bid/ask absent ou invalide",
             "maturity_before_preferred_window" => "maturite avant la fenetre souhaitee",
             "maturity_after_preferred_window" => "maturite apres la fenetre souhaitee",
@@ -1972,12 +2108,14 @@ fn human_reasons(reasons: &[String]) -> String {
             "scenario_return_below_buy_threshold" => "rendement net positif mais sous le seuil BUY scenario",
             "target_probability_too_low" => "probabilite d'atteindre la cible trop faible",
             "breakeven_probability_too_low" => "probabilite d'atteindre le breakeven trop faible",
-            "expected_value_negative" => "EV risk-neutral negative: le prix actuel n'offre pas d'avantage mathematique",
+            "expected_value_negative" => {
+                "fair-value Q negative: le prix actuel est cher selon le modele risk-neutral"
+            }
             "monte_carlo_ev_negative" => {
                 "EV Monte Carlo negative: les trajectoires simulees ne compensent pas le risque"
             }
             "target_before_stop_not_favored" => {
-                "Monte Carlo defavorable: le stop/KO arrive au moins aussi souvent que le target"
+                "Monte Carlo defavorable: le stop mark-to-market/KO arrive au moins aussi souvent que le target"
             }
             "barrier_touch_probability_too_high" => "probabilite de toucher la barriere trop elevee",
             "linear_financing_unmodeled_long_horizon" => {

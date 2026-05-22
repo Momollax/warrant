@@ -349,6 +349,30 @@ mod tests {
     }
 
     #[test]
+    fn black_scholes_put_call_parity_with_dividend_yield() {
+        let input = BlackScholesInput {
+            kind: OptionKind::Call,
+            spot: 100.0,
+            strike: 95.0,
+            years_to_maturity: 0.75,
+            risk_free_rate: 0.04,
+            dividend_yield: 0.015,
+            volatility: 0.32,
+        };
+        let call = black_scholes_price(input).unwrap();
+        let put = black_scholes_price(BlackScholesInput {
+            kind: OptionKind::Put,
+            ..input
+        })
+        .unwrap();
+
+        let expected = input.spot * (-input.dividend_yield * input.years_to_maturity).exp()
+            - input.strike * (-input.risk_free_rate * input.years_to_maturity).exp();
+
+        assert_close(call - put, expected, 1e-9);
+    }
+
+    #[test]
     fn implied_volatility_recovers_reference_volatility() {
         let price = black_scholes_price(BlackScholesInput {
             kind: OptionKind::Put,
@@ -405,6 +429,51 @@ mod tests {
     }
 
     #[test]
+    fn greeks_match_finite_difference_estimates() {
+        let input = BlackScholesInput {
+            kind: OptionKind::Call,
+            spot: 120.0,
+            strike: 115.0,
+            years_to_maturity: 0.8,
+            risk_free_rate: 0.03,
+            dividend_yield: 0.01,
+            volatility: 0.25,
+        };
+        let greeks = black_scholes_greeks(input).unwrap();
+        let base = black_scholes_price(input).unwrap();
+        let spot_step = 0.01;
+        let vol_step = 0.0001;
+        let up_spot = black_scholes_price(BlackScholesInput {
+            spot: input.spot + spot_step,
+            ..input
+        })
+        .unwrap();
+        let down_spot = black_scholes_price(BlackScholesInput {
+            spot: input.spot - spot_step,
+            ..input
+        })
+        .unwrap();
+        let up_vol = black_scholes_price(BlackScholesInput {
+            volatility: input.volatility + vol_step,
+            ..input
+        })
+        .unwrap();
+        let down_vol = black_scholes_price(BlackScholesInput {
+            volatility: input.volatility - vol_step,
+            ..input
+        })
+        .unwrap();
+
+        let fd_delta = (up_spot - down_spot) / (2.0 * spot_step);
+        let fd_gamma = (up_spot - 2.0 * base + down_spot) / spot_step.powi(2);
+        let fd_vega_per_vol_point = (up_vol - down_vol) / (2.0 * vol_step) / 100.0;
+
+        assert_close(greeks.delta, fd_delta, 1e-5);
+        assert_close(greeks.gamma, fd_gamma, 1e-5);
+        assert_close(greeks.vega_per_vol_point, fd_vega_per_vol_point, 1e-5);
+    }
+
+    #[test]
     fn lognormal_probability_direction_depends_on_option_side() {
         let call = lognormal_probability(OptionKind::Call, 100.0, 110.0, 1.0, 0.0, 0.20)
             .unwrap();
@@ -427,6 +496,23 @@ mod tests {
 
         assert!(touch > terminal, "touch={touch}, terminal={terminal}");
         assert!(touch <= 1.0);
+    }
+
+    #[test]
+    fn first_touch_zero_log_drift_matches_reflection_principle() {
+        let spot: f64 = 100.0;
+        let level: f64 = 110.0;
+        let years: f64 = 1.0;
+        let volatility: f64 = 0.20;
+        let drift = 0.5 * volatility * volatility;
+        let log_distance = (level / spot).ln();
+        let expected = 2.0 * (1.0 - normal_cdf(log_distance / (volatility * years.sqrt())));
+
+        let touch =
+            first_touch_probability(OptionKind::Call, spot, level, years, drift, volatility)
+                .unwrap();
+
+        assert_close(touch, expected, 1e-9);
     }
 
     #[test]
@@ -462,6 +548,37 @@ mod tests {
         .unwrap();
 
         assert!(iv > 0.10 && iv < 2.00, "iv={iv}");
+    }
+
+    #[test]
+    fn invalid_option_inputs_are_rejected() {
+        let input = BlackScholesInput {
+            kind: OptionKind::Call,
+            spot: 100.0,
+            strike: 100.0,
+            years_to_maturity: 1.0,
+            risk_free_rate: 0.05,
+            dividend_yield: 0.0,
+            volatility: 0.20,
+        };
+
+        assert!(black_scholes_price(BlackScholesInput { spot: 0.0, ..input }).is_none());
+        assert!(black_scholes_price(BlackScholesInput {
+            volatility: f64::NAN,
+            ..input
+        })
+        .is_none());
+        assert!(black_scholes_greeks(BlackScholesInput {
+            years_to_maturity: -1.0,
+            ..input
+        })
+        .is_none());
+        assert!(implied_volatility(OptionKind::Call, -1.0, 100.0, 100.0, 1.0, 0.0, 0.0)
+            .is_none());
+        assert!(lognormal_probability(OptionKind::Call, 100.0, 110.0, 0.0, 0.0, 0.2)
+            .is_none());
+        assert!(first_touch_probability(OptionKind::Call, 100.0, 110.0, 1.0, 0.0, 0.0)
+            .is_none());
     }
 
     fn assert_close(actual: f64, expected: f64, tolerance: f64) {

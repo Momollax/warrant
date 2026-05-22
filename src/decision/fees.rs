@@ -171,6 +171,56 @@ mod tests {
         assert_close(fees.deposit_fee, 5.0, 1e-9);
     }
 
+    #[test]
+    fn mixed_fixed_and_percentage_fees_match_manual_cashflows() {
+        let config = DecisionConfig {
+            broker_fee_profile: "manual".to_string(),
+            fee_order_notional: 1000.0,
+            fee_buy_fixed: 1.90,
+            fee_buy_pct: 0.10,
+            fee_sell_fixed: 1.90,
+            fee_sell_pct: 0.20,
+            fee_deposit_fixed: 2.00,
+            fee_deposit_pct: 0.30,
+            ..DecisionConfig::default()
+        };
+        let stop = StopPlan {
+            underlying_stop_price: 90.0,
+            estimated_product_stop_price: 4.50,
+            loss_pct: 10.0,
+            distance_to_stop_pct: 10.0,
+            stop_reason: StopReason::Atr,
+        };
+        let target_1 = TargetPlan {
+            underlying_target_price: 105.0,
+            estimated_product_target_price: 5.50,
+            gain_pct: 10.0,
+            distance_to_target_pct: 5.0,
+            target_reason: TargetReason::RiskMultiple,
+        };
+        let target_2 = TargetPlan {
+            underlying_target_price: 110.0,
+            estimated_product_target_price: 6.00,
+            gain_pct: 20.0,
+            distance_to_target_pct: 10.0,
+            target_reason: TargetReason::RiskMultiple,
+        };
+
+        let fees = compute_fee_plan(5.0, &stop, &target_1, &target_2, &config).unwrap();
+        let buy_fee = 1.90 + 1000.0 * 0.10 / 100.0;
+        let deposit_fee = 2.00 + 1000.0 * 0.30 / 100.0;
+        let target_2_notional = 1000.0 * 6.00 / 5.0;
+        let sell_target_2_fee = 1.90 + target_2_notional * 0.20 / 100.0;
+        let cost_basis = 1000.0 + buy_fee + deposit_fee;
+        let expected_target_2 =
+            ((target_2_notional - sell_target_2_fee) - cost_basis) / cost_basis * 100.0;
+
+        assert_close(fees.buy_fee, buy_fee, 1e-12);
+        assert_close(fees.deposit_fee, deposit_fee, 1e-12);
+        assert_close(fees.sell_target_2_fee, sell_target_2_fee, 1e-12);
+        assert_close(fees.net_target_2_gain_pct, expected_target_2, 1e-12);
+    }
+
     fn assert_close(actual: f64, expected: f64, tolerance: f64) {
         assert!(
             (actual - expected).abs() <= tolerance,

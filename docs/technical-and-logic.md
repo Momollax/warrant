@@ -959,7 +959,8 @@ Logique:
 
 ```text
 produits scenario nettoyes
-  -> mode auto: conserve calls et puts, sauf filtre explicite call/put
+  -> mode auto: conserve le cote coherent avec la these de marche
+  -> mode mixed/all: conserve calls et puts pour audit volontaire
   -> filtre maturite apres la date cible
   -> filtre fenetre de maturite voulue
   -> prix d'entree = ask executable
@@ -968,7 +969,27 @@ produits scenario nettoyes
   -> calcul rendement net, point mort sous-jacent, score intentionnel
 ```
 
-En mode `SCENARIO_SIDE=auto`, le type nominal du produit (`call` ou `put`) sert au pricing du produit, mais la probabilite `Tch<=D` suit la direction de la these de marche: cible au-dessus du spot = first-touch haussier, cible sous le spot = first-touch baissier. Cela evite le faux 100% qui apparaitrait si un call etait evalue sur une cible situee sous le spot.
+En mode `SCENARIO_SIDE=auto`, le moteur filtre le cote nominal du produit selon la these de marche: cible au-dessus du spot = produits haussiers, cible sous le spot = produits baissiers. En mode `mixed`/`all` ou avec `SCENARIO_ALLOW_OPPOSITE_SIDE=1`, les deux cotes peuvent etre conserves pour audit; la probabilite `Tch<=D` suit alors toujours la direction de la these de marche, pas le sens nominal du warrant.
+
+Le target peut etre une zone:
+
+```text
+./manage.sh scenario apple AAPL 365..375 2026-10-31 2027-01-01 2028-12-31 auto 500
+SCENARIO_TARGET_RANGE=365..375
+SCENARIO_TARGET_MIN=365
+SCENARIO_TARGET_MAX=375
+```
+
+Dans ce cas:
+
+- `target_price = (min + max) / 2`
+- les projections sont calculees sur `min`, `mid`, `max`
+- `Net@D` utilise le milieu de zone par defaut
+- `Str@D` utilise le pire rendement stress IV de la zone
+- `Tch<=D` mesure la probabilite de toucher l'entree de zone: `min` pour une these haussiere, `max` pour une these baissiere
+- `SCENARIO_RANGE_DECISION_MODE=avg` permet de classer selon la moyenne de zone
+- `SCENARIO_RANGE_DECISION_MODE=worst` permet de classer selon le pire rendement de zone
+- si le pire rendement de la zone devient negatif et que le mode n'est pas `mid`, le moteur ajoute `target_range_has_negative_edge`
 
 Modeles scenario actuellement supportes:
 
@@ -1005,7 +1026,15 @@ Champs principaux:
 | `iv%` | Volatilite implicite actuelle quand elle est disponible. |
 | `score` | Score de coherence: rendement net, qualite de donnees, liquidite, spread, IV relative et fit de maturite. |
 | `KO%` | Probabilite first-touch de barriere avant la date cible. |
-| `MCev` | Esperance de rendement de la simulation Monte Carlo target/stop/KO. |
+| `MCev` | Moyenne des rendements simules Monte Carlo avec target, stop mark-to-market et KO. |
+
+Pour une range, le panneau Notes ajoute:
+
+```text
+range low..high: net min/moy/max
+```
+
+Cela evite de choisir un produit optimal uniquement sur un prix cible trop precis, alors que l'intention humaine est souvent "autour de cette zone".
 
 Indicateurs mathematiques et statistiques ajoutes:
 
@@ -1015,7 +1044,7 @@ Indicateurs mathematiques et statistiques ajoutes:
 | `PTgt` | Probabilite lognormale que le sous-jacent atteigne le prix cible a la date cible. | Mesure la difficulte de la these selon vol et horizon. |
 | `zTarget` | `z=(ln(target/spot)-(r-q-0.5*sigma^2)T)/(sigma*sqrt(T))`. | Nombre d'ecarts-types lognormaux a franchir. |
 | `zBE` | Meme formule avec `level=breakeven`. | Effort statistique minimal pour ne pas perdre. |
-| `EV` | Valeur attendue risk-neutral du warrant a l'horizon cible, nette de frais, comparee au prix d'entree. | Detecte si le prix d'entree est cher/pas cher selon le modele, sans supposer que la cible arrive. |
+| `EV` / `Fair-value Q` | Fair-value risk-neutral portee a l'horizon cible, nette de frais, comparee au prix d'entree. | Detecte si le prix d'entree est cher/pas cher selon le modele, sans supposer que la cible arrive. Ce n'est pas une vraie esperance monde reel. |
 | `Sharpe-like` | `E[R] / std(R)` sur un modele binaire cible atteinte vs perte totale. | Indicateur simple rendement/risque, volontairement conservateur. |
 | `Kelly` | `max(0, (b*p-q)/b)` avec `b=gain/perte`, `p=P(target)`, `q=1-p`. | Taille theorique agressive; a lire comme plafond statistique, pas comme consigne. |
 | `Delta` | Delta Black-Scholes converti par `fx/parity`. | Variation theorique du warrant pour +1 unite de sous-jacent. |
@@ -1053,10 +1082,11 @@ Decision:
 
 Garde-fous supplementaires:
 
-- `expected_value_negative`: EV risk-neutral negative; bloque `BUY`, mais peut rester `WATCH` si le payoff conditionnel au target est positif;
+- `expected_value_negative`: fair-value Q negative; bloque `BUY`, mais peut rester `WATCH` si le payoff conditionnel au target est positif;
 - `monte_carlo_ev_negative`: EV Monte Carlo negative; bloque `BUY`, mais peut rester `WATCH`;
-- `target_before_stop_not_favored`: le stop/KO arrive au moins aussi souvent que le target;
+- `target_before_stop_not_favored`: le stop mark-to-market/KO arrive au moins aussi souvent que le target;
 - `barrier_touch_probability_too_high`: probabilite KO superieure a `SCENARIO_MAX_BUY_KO_PROB_PCT`;
+- `target_range_has_negative_edge`: une partie de la zone cible donne un rendement net negatif;
 - `linear_financing_unmodeled_long_horizon`: produit lineaire open-end sur horizon long; bloque `BUY` tant que le financement futur n'est pas projete;
 - `SCENARIO_MAX_UNMODELED_LINEAR_BUY_DAYS`: seuil de jours pour ce garde-fou, `45` par defaut.
 

@@ -216,6 +216,34 @@ Exemple Apple:
 BROKER_FEE_PROFILE=bourse_direct_1000 FEE_ORDER_NOTIONAL=1000 CANDLES_RANGE=60d CANDLES_INTERVAL=60m MARKET_DATA_REFRESH=cache ./manage.sh scenario apple AAPL 330 2026-10-31 2027-01-01 2027-03-31 500
 ```
 
+Target en zone:
+
+```bash
+BROKER_FEE_PROFILE=bourse_direct_1000 FEE_ORDER_NOTIONAL=1000 CANDLES_RANGE=1y CANDLES_INTERVAL=1d MARKET_DATA_REFRESH=cache ./manage.sh scenario apple AAPL 365..375 2026-10-31 2027-01-01 2028-12-31 auto 500
+```
+
+La syntaxe accepte aussi `365:375`, `365;375`, ou les variables:
+
+```env
+SCENARIO_TARGET_RANGE=365..375
+SCENARIO_TARGET_MIN=365
+SCENARIO_TARGET_MAX=375
+```
+
+Avec une range, `target_price` devient le milieu de zone pour les projections principales. Le moteur calcule aussi les projections au bas et au haut de la zone. Par defaut, la decision reste basee sur le milieu de zone pour conserver le comportement d'une cible unique:
+
+- `Net@D` et `P/L@D`: milieu de zone;
+- `Str@D`: pire rendement stressé de la zone;
+- `Tch<=D`: probabilite first-touch d'entrer dans la zone, donc bas de zone pour une these haussiere et haut de zone pour une these baissiere;
+- Notes: affichage min/moy/max de rendement net sur la zone.
+
+Pour faire influencer la range sur la decision:
+
+```env
+SCENARIO_RANGE_DECISION_MODE=avg
+SCENARIO_RANGE_DECISION_MODE=worst
+```
+
 Exemple Hermes haussier:
 
 ```bash
@@ -228,16 +256,19 @@ Exemple Hermes baissier:
 BROKER_FEE_PROFILE=bourse_direct_1000 FEE_ORDER_NOTIONAL=1000 CANDLES_RANGE=60d CANDLES_INTERVAL=60m MARKET_DATA_REFRESH=cache ./manage.sh scenario hermes RMS.PA 1300 2026-10-31 2027-01-01 2027-03-31 500
 ```
 
-Le mode par defaut garde les deux cotes (`call` et `put`) et laisse le moteur classer les produits. Le sens de la these vient du target:
+Le mode par defaut (`auto`) suit la direction de la these. Il garde les produits haussiers quand le target est au-dessus du spot et les produits baissiers quand le target est sous le spot:
 
 - target au-dessus du spot: probabilites first-touch calculees comme scenario haussier
 - target sous le spot: probabilites first-touch calculees comme scenario baissier
 
-Forcer une direction:
+Forcer une direction ou analyser les deux cotes:
 
 ```bash
 ./manage.sh scenario hermes RMS.PA 1700 2026-10-31 2027-01-01 2027-03-31 force-put 500
+./manage.sh scenario hermes RMS.PA 1700 2026-10-31 2027-01-01 2027-03-31 mixed 500
 ```
+
+`mixed`/`all` garde les calls et puts ensemble. `SCENARIO_ALLOW_OPPOSITE_SIDE=1` permet aussi de conserver les produits opposes en mode `auto`, mais c'est un mode d'audit, pas le comportement recommande.
 
 ### Bougies et cache
 
@@ -323,19 +354,19 @@ Touches:
 
 Quand `m` est utilise, l'application recalcule:
 
-- les calls et les puts si `SCENARIO_SIDE=auto`
+- le cote coherent avec la nouvelle cible si `SCENARIO_SIDE=auto`
 - les prix projetes
 - les probabilites
 - les decisions
 - l'affichage
 
-`SCENARIO_SIDE=auto` ne deduit donc plus un seul cote a partir de la cible. Une these haussiere peut garder un put, et une these baissiere peut garder un call, si le pricing projete montre que le produit peut devenir rentable via l'IV, le theta restant ou la convexite. Les probabilites `Tch<=D` restent calculees dans la direction de la these de marche, pas dans le sens nominal du warrant.
+`SCENARIO_SIDE=auto` deduit le cote a partir de la cible. Une these haussiere garde les produits haussiers, une these baissiere garde les produits baissiers. Utilise `mixed`/`all` ou `SCENARIO_ALLOW_OPPOSITE_SIDE=1` pour analyser volontairement les deux cotes; dans ce cas les probabilites `Tch<=D` restent calculees dans la direction de la these de marche, pas dans le sens nominal du warrant.
 
 Colonnes utiles du mode scenario:
 
-- `Net@D`: rendement net projete a la date cible, apres frais broker et spread de sortie estime
-- `P/L@D`: gain/perte en euros a la date cible pour `FEE_ORDER_NOTIONAL`
-- `Str@D`: rendement net a la date cible si l'IV baisse de `SCENARIO_VOL_SHOCK_POINTS`
+- `Net@D`: rendement net projete a la date cible, apres frais broker et spread de sortie estime. Avec une range, c'est le milieu de zone par defaut.
+- `P/L@D`: gain/perte en euros a la date cible pour `FEE_ORDER_NOTIONAL`. Avec une range, c'est le milieu de zone par defaut.
+- `Str@D`: rendement net a la date cible si l'IV baisse de `SCENARIO_VOL_SHOCK_POINTS`. Avec une range, c'est le pire stress de la zone.
 - `BE mv`: mouvement minimum du sous-jacent pour atteindre le point mort
 - `Tch<=D`: probabilite first-touch d'atteindre la cible avant ou a la date scenario
 - `KO%`: probabilite first-touch de barriere/knock-out avant la date cible, si barriere connue
@@ -409,11 +440,11 @@ Puis il observe dans chaque trajectoire:
 
 Les champs affiches sont:
 
-- `MCev`: moyenne des P/L simules
+- `MCev`: moyenne des P/L simules avec target, stop mark-to-market et KO
 - `p05`, `p50`, `p95` dans les notes: percentiles pessimiste, median et favorable
 - `target_first`, `stop_first`, `KO` dans les notes
 
-Si `MCev < 0`, le moteur ajoute `monte_carlo_ev_negative`. Si le stop/KO arrive au moins aussi souvent que le target, il ajoute `target_before_stop_not_favored`.
+Si `MCev < 0`, le moteur ajoute `monte_carlo_ev_negative`. Si le stop mark-to-market/KO arrive au moins aussi souvent que le target, il ajoute `target_before_stop_not_favored`.
 
 ## 7. Concepts financiers utilises
 
@@ -558,17 +589,17 @@ Pour un put:
 P(level atteint) = Phi(z)
 ```
 
-### EV risk-neutral
+### Fair-value risk-neutral
 
-L'EV affichee est une estimation risk-neutral:
+La valeur affichee historiquement comme `EV` est une mesure de fair-value risk-neutral, pas une vraie esperance monde reel:
 
 ```text
 fair_now = BlackScholes(spot actuel, strike, maturite)
 expected_exit = fair_now * exp(r * T_to_target)
-EV = rendement net attendu apres frais
+Fair-value Q = rendement net de expected_exit vs prix d'entree apres frais
 ```
 
-Si `EV < 0`, le moteur ajoute `expected_value_negative`. Le produit peut rester `WATCH` si le scenario cible est interessant, mais il ne doit pas sortir en `BUY`: cela signifie que le prix d'entree est cher selon le modele risk-neutral, meme si le payoff conditionnel au target parait attractif.
+Si cette valeur est negative, le moteur ajoute `expected_value_negative`. Le produit peut rester `WATCH` si le scenario cible est interessant, mais il ne doit pas sortir en `BUY`: cela signifie que le prix d'entree est cher selon le modele risk-neutral, meme si le payoff conditionnel au target parait attractif.
 
 Elle ne represente pas une conviction humaine. Elle sert a comparer le prix du produit avec une valorisation theorique.
 
